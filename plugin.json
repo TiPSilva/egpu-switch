@@ -1,0 +1,6 @@
+{
+  "name": "eGPU-Switch",
+  "author": "TiPSilva",
+  "flags": ["root"],
+  "api_version": 1
+}

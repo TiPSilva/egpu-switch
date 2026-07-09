@@ -1,0 +1,32 @@
+{
+  "name": "egpu-switch",
+  "version": "0.1.0",
+  "description": "Toggle all-ways-egpu boot-VGA (eGPU/iGPU) and recover the display manager, from Deck mode.",
+  "author": "TiPSilva",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TiPSilva/egpu-switch"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w",
+    "zip": "bash scripts/build-zip.sh"
+  },
+  "devDependencies": {
+    "@decky/rollup": "^1.0.2",
+    "@types/react": "19.1.1",
+    "@types/react-dom": "19.1.1",
+    "rollup": "^4.22.4",
+    "tslib": "^2.6.3",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "@decky/api": "^1.1.3",
+    "@decky/ui": "^4.11.6",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "react-icons": "^5.2.1"
+  }
+}
