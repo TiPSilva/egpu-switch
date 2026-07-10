@@ -185,23 +185,38 @@ def get_pci_driver(bus_id: str) -> str | None:
         return None
 
 
-async def modprobe_remove(module: str) -> tuple[bool, str]:
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.run,
-            ["modprobe", "-r", module],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=clean_subprocess_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"modprobe -r {module} timed out"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-    if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
-    return True, ""
+async def modprobe_remove(module: str, retries: int = 3, retry_delay: float = 1.0) -> tuple[bool, str]:
+    """
+    Confirmed on hardware: nvidia_drm can transiently report "in use" right
+    after the display manager has fully stopped (systemctl stop already
+    waited for every process to exit) - DRM/KMS driver teardown can have a
+    short async cleanup tail before the module's use-count actually reaches
+    zero. Retry a few times on that specific failure only; anything else
+    (a real, persistent block) fails immediately without wasting retries.
+    """
+    last_err = ""
+    for attempt in range(retries):
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                ["modprobe", "-r", module],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=clean_subprocess_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"modprobe -r {module} timed out"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+        if proc.returncode == 0:
+            return True, ""
+        last_err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        if "in use" not in last_err.lower():
+            break
+        if attempt < retries - 1:
+            await asyncio.sleep(retry_delay)
+    return False, last_err
 
 
 def write_sysfs(path: str, value: str) -> tuple[bool, str]:
