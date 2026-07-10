@@ -1,5 +1,6 @@
 import asyncio
 import glob
+import json
 import os
 import pwd
 import re
@@ -185,6 +186,82 @@ def get_pci_driver(bus_id: str) -> str | None:
         return None
 
 
+PCIE_GT_TO_GEN = {
+    "2.5GT/s": "Gen1",
+    "5GT/s": "Gen2",
+    "8GT/s": "Gen3",
+    "16GT/s": "Gen4",
+    "32GT/s": "Gen5",
+    "64GT/s": "Gen6",
+}
+LNKSTA_RE = re.compile(r"LnkSta:\s*Speed\s+([0-9.]+GT/s)[^,]*,\s*Width\s+(x\d+)")
+
+
+async def get_pcie_link_info(bus_id: str) -> dict | None:
+    """
+    Negotiated PCIe link speed/width for the given function, read from
+    lspci -vv's LnkSta line. Works for any connection type (Thunderbolt or
+    OCuLink) since both ultimately negotiate a plain PCIe link with their
+    upstream bridge - unlike Thunderbolt-specific info, this never depends
+    on boltctl being present.
+    """
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            ["lspci", "-vv", "-s", bus_id],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=clean_subprocess_env(),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    m = LNKSTA_RE.search(proc.stdout)
+    if not m:
+        return None
+    speed = m.group(1)
+    return {"speed": speed, "generation": PCIE_GT_TO_GEN.get(speed), "width": m.group(2)}
+
+
+async def get_thunderbolt_info() -> dict | None:
+    """
+    Best-effort Thunderbolt tunnel info via `boltctl list`: takes the first
+    peripheral's name/generation/rx/tx speed fields, whichever appear first
+    in the output. Not rigorously matched to the exact eGPU bus ID (boltctl
+    doesn't expose PCI addresses), fine for a single-eGPU setup. Returns None
+    when boltctl isn't installed (e.g. OCuLink, no Thunderbolt subsystem) or
+    reports nothing, so the caller can omit this section entirely rather
+    than showing an error.
+    """
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            ["boltctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=clean_subprocess_env(),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+
+    def field(pattern: str) -> str | None:
+        m = re.search(pattern, proc.stdout)
+        return m.group(1).strip() if m else None
+
+    name = field(r"name:\s*(.+)")
+    generation = field(r"generation:\s*(.+)")
+    rx_speed = field(r"rx speed:\s*([^\n]+)")
+    tx_speed = field(r"tx speed:\s*([^\n]+)")
+    if not name and not generation:
+        return None
+    return {"name": name, "generation": generation, "rx_speed": rx_speed, "tx_speed": tx_speed}
+
+
 async def modprobe_remove(module: str, retries: int = 3, retry_delay: float = 1.0) -> tuple[bool, str]:
     """
     Confirmed on hardware: nvidia_drm can transiently report "in use" right
@@ -223,6 +300,41 @@ def write_sysfs(path: str, value: str) -> tuple[bool, str]:
     try:
         with open(path, "w") as f:
             f.write(value)
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+DEFAULT_SETTINGS = {"auto_eject": False}
+
+
+def get_settings_path() -> str | None:
+    settings_dir = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
+    if not settings_dir:
+        return None
+    return os.path.join(settings_dir, "settings.json")
+
+
+def load_settings() -> dict:
+    path = get_settings_path()
+    if not path or not os.path.isfile(path):
+        return dict(DEFAULT_SETTINGS)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return {**DEFAULT_SETTINGS, **data}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(settings: dict) -> tuple[bool, str]:
+    path = get_settings_path()
+    if not path:
+        return False, "DECKY_PLUGIN_SETTINGS_DIR is not set"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(settings, f)
         return True, ""
     except OSError as e:
         return False, str(e)
@@ -338,13 +450,72 @@ class Plugin:
         )
         return parsed
 
+    async def get_connection_info(self) -> dict:
+        """
+        Separate, on-demand RPC rather than folded into get_status(): this
+        involves extra subprocess calls (lspci -vv, boltctl) that are only
+        worth paying for when the user actually opens the Connection
+        section, not on every 5s status poll.
+        """
+        binary = find_egpu_binary()
+        bus_id = None
+        if binary:
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    [binary, "status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=clean_subprocess_env(),
+                )
+                bus_id = parse_status(proc.stdout or "").get("bus_id")
+            except subprocess.TimeoutExpired:
+                pass
+
+        pcie = await get_pcie_link_info(bus_id) if bus_id else None
+        thunderbolt = await get_thunderbolt_info()
+
+        return {
+            "pcie_generation": pcie.get("generation") if pcie else None,
+            "pcie_speed": pcie.get("speed") if pcie else None,
+            "pcie_width": pcie.get("width") if pcie else None,
+            "thunderbolt_generation": thunderbolt.get("generation") if thunderbolt else None,
+            "thunderbolt_rx_speed": thunderbolt.get("rx_speed") if thunderbolt else None,
+            "thunderbolt_tx_speed": thunderbolt.get("tx_speed") if thunderbolt else None,
+            "thunderbolt_name": thunderbolt.get("name") if thunderbolt else None,
+        }
+
+    # ---- settings ----
+
+    async def get_settings(self) -> dict:
+        return load_settings()
+
+    async def set_auto_eject(self, enabled: bool) -> dict:
+        settings = load_settings()
+        settings["auto_eject"] = bool(enabled)
+        ok, err = save_settings(settings)
+        if not ok:
+            return {"ok": False, "error": err}
+        return {"ok": True}
+
     # ---- actions ----
 
     async def enable_egpu(self) -> dict:
         return await self._set_boot_vga("egpu")
 
     async def disable_egpu(self) -> dict:
-        return await self._switch_to_igpu_and_eject()
+        # Automatic eject is opt-in (Advanced setting, default off): it folds
+        # a multi-second operation (stop DM, modprobe -r with retries, PCI
+        # remove, start DM) into a single click, but that duration means an
+        # unlucky collision with Decky's own plugin-reload/shutdown (~5s grace
+        # period before SIGKILL) can leave the display manager stopped with no
+        # chance to run our cleanup code. Default stays the old, faster,
+        # boot_vga-only switch; eject remains a deliberate separate step.
+        settings = load_settings()
+        if settings.get("auto_eject"):
+            return await self._switch_to_igpu_and_eject()
+        return await self._set_boot_vga("internal")
 
     async def eject_egpu(self) -> dict:
         """

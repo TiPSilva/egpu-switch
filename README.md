@@ -116,17 +116,31 @@ Should return `200`.
 
 ## Usage
 
-Open the quick access menu (QAM) and go to the "eGPU Switch" tab. The status shows
-whether `all-ways-egpu` is installed, configured, whether the eGPU is connected, and
-which GPU is currently active.
+Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
 
+- **Thunderbolt cable**: always-visible indicator, a colored dot plus a plain-language
+  label, so you don't have to parse the more detailed Status text just to know if it's
+  safe to disconnect:
+  - 🟢 **Safe**: nothing is currently bound to the eGPU (either it was never connected, or
+    it was successfully ejected while the cable is still plugged in).
+  - 🔴 **Not safe (in use)**: the eGPU is the active display GPU right now.
+  - 🔴 **Not safe (not ejected)**: the eGPU is connected but idle, either never switched to
+    or already switched away from. Still not safe to unplug even though nothing looks
+    "in use": press **Eject eGPU** first. This distinction exists because an early tester
+    was confused seeing "not safe" on an eGPU they'd never activated; see [Known
+    limitation](#known-limitation-nvidia-driver-hot-unplug) below for why idle still isn't
+    safe.
+- **Status**: detailed text on whether `all-ways-egpu` is installed, configured, whether
+  the eGPU is connected, and which GPU is currently active.
 - **Switch to eGPU / Switch to iGPU**: toggles boot VGA and restarts the display manager.
   Always asks for confirmation first, since the screen flickers and the current Deck Mode
   session briefly restarts (5-15s); this is expected. Validated on hardware: the
   gamescope session automatically routes output to the TV after the restart, with no
   manual "arrange displays" step needed. Switching to eGPU always triggers a PCI rescan
   first, since after an eject the eGPU is genuinely gone from `lspci` (not just slow to
-  enumerate), and `all-ways-egpu`'s own retry loop never forces a rescan on its own.
+  enumerate), and `all-ways-egpu`'s own retry loop never forces a rescan on its own. By
+  default, switching to iGPU does **not** eject the eGPU automatically (see **Eject eGPU**
+  below); enable **Automatic eject** under **Advanced** to change that.
 - **Eject eGPU**: **stops the display manager** (confirmed on hardware via `fuser
   /dev/nvidia*` that gamescope, mangoapp, steam, steamwebhelper and hhd-ui keep the eGPU
   open for the whole session, even with the iGPU active, so only stopping the whole
@@ -145,6 +159,18 @@ which GPU is currently active.
   PCI device detection pass. Normally unnecessary (reconnecting the Thunderbolt cable
   already triggers automatic hotplug), but serves as manual recovery if the eGPU doesn't
   reappear on its own after being reconnected.
+- **Connection** (collapsed by default): fetched on demand, only when you expand it, since
+  it costs a couple of extra subprocess calls not worth paying on every 5s status poll.
+  Shows the negotiated PCIe link speed/width (works for any connection type, including
+  OCuLink, since it's read from the GPU's own PCIe link status via `lspci -vv`, nothing
+  Thunderbolt-specific) plus Thunderbolt generation, tunnel speed and controller name when
+  the connection actually goes through Thunderbolt (via `boltctl list`, best-effort single
+  eGPU; silently omitted when not applicable, e.g. OCuLink or no `boltctl` installed).
+- **Advanced** (collapsed by default):
+  - **Automatic eject (experimental)**: off by default. When enabled, **Switch to iGPU**
+    also ejects the eGPU automatically in the same operation, one flicker instead of two
+    separate steps. See [Known limitation](#known-limitation-nvidia-driver-hot-unplug)
+    below for why this stays opt-in rather than becoming the default.
 
 ## Known limitation: NVIDIA driver hot-unplug
 
@@ -154,7 +180,7 @@ boot VGA already switched to the iGPU) can trigger a kernel `BUG()` and crash th
 graphical session, requiring a reboot. This actually happened during this plugin's testing
 (confirmed via `dmesg`: crash in `nvidia_ctl_close → nvidia_close → __fput → do_exit`).
 
-**Safe flow to disconnect the eGPU:**
+**Safe flow to disconnect the eGPU (default settings):**
 1. Switch to iGPU (**Switch to iGPU**), if not already.
 2. Press **Eject eGPU** and wait for the "eGPU ejected. Safe to disconnect the Thunderbolt
    cable now." message. Only then is it safe to pull the cable.
@@ -164,6 +190,38 @@ graphical session, requiring a reboot. This actually happened during this plugin
 Reconnecting afterward is usually automatic (the kernel detects the Thunderbolt hotplug
 and re-enumerates the PCI device on its own); use **Rescan for eGPU** only if that doesn't
 happen.
+
+### Why "Automatic eject" is opt-in, not the default
+
+Folding eject into **Switch to iGPU** (the **Advanced → Automatic eject** setting) removes
+a manual step, but it also means that single click now runs a longer sequence: stop the
+display manager, switch boot VGA, unload NVIDIA kernel modules (with a short retry if
+`nvidia_drm` transiently reports "in use" right after the display manager stops, seen on
+real hardware), detach the PCI function(s), then start the display manager again. In the
+worst case this can take several seconds.
+
+Decky Loader gives each plugin a short grace period (observed to be about 5 seconds) to
+shut down cleanly when it reloads plugins (its own auto-update check, a manual reload from
+the Developer tab, etc.) before sending SIGKILL. If that reload happens to fire while the
+automatic-eject sequence is still running, the plugin process can be killed mid-operation.
+SIGKILL cannot be caught or handled in Python, so the `finally` block that guarantees the
+display manager gets restarted never runs in that case, potentially leaving the session
+stopped with no automatic recovery. This was observed on real hardware during development.
+
+With the default (manual, two-step) flow, each individual click only ever runs a single,
+short operation (one systemctl restart, or one eject), which comfortably fits inside that
+grace period. That's why it stays the default; **Automatic eject** trades a small amount
+of this risk for convenience, which is why it's labeled experimental.
+
+If a stopped display manager does happen (with either flow), recover via SSH:
+```sh
+sudo systemctl start display-manager.service user@<uid>
+```
+and if the plugin's own QAM overlay disappeared too (a different symptom, Decky's own
+process was killed, not the display manager), also run:
+```sh
+sudo systemctl start plugin_loader
+```
 
 ## Testing safely
 

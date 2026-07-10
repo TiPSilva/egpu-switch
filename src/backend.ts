@@ -20,9 +20,26 @@ export interface OpResult {
   removed?: string[];
 }
 
+export interface ConnectionInfo {
+  pcie_generation: string | null;
+  pcie_speed: string | null;
+  pcie_width: string | null;
+  thunderbolt_generation: string | null;
+  thunderbolt_rx_speed: string | null;
+  thunderbolt_tx_speed: string | null;
+  thunderbolt_name: string | null;
+}
+
+export interface Settings {
+  auto_eject: boolean;
+}
+
 export const getStatus = () => call<[], EgpuStatus>('get_status');
 export const enableEgpu = () => call<[], OpResult>('enable_egpu');
 export const disableEgpu = () => call<[], OpResult>('disable_egpu');
 export const restartDisplayManager = () => call<[], OpResult>('restart_display_manager');
 export const ejectEgpu = () => call<[], OpResult>('eject_egpu');
 export const rescanPci = () => call<[], OpResult>('rescan_pci');
+export const getConnectionInfo = () => call<[], ConnectionInfo>('get_connection_info');
+export const getSettings = () => call<[], Settings>('get_settings');
+export const setAutoEject = (enabled: boolean) => call<[boolean], OpResult>('set_auto_eject', enabled);

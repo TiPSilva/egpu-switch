@@ -1,15 +1,19 @@
-import { ButtonItem, Field, PanelSection, PanelSectionRow, Spinner, showModal } from '@decky/ui';
+import { ButtonItem, Field, PanelSection, PanelSectionRow, Spinner, ToggleField, showModal } from '@decky/ui';
 import { FC, useCallback, useEffect, useRef, useState } from 'react';
 
 import {
+  ConnectionInfo,
   EgpuStatus,
   OpResult,
   disableEgpu,
   ejectEgpu,
   enableEgpu,
+  getConnectionInfo,
+  getSettings,
   getStatus,
   rescanPci,
   restartDisplayManager,
+  setAutoEject,
 } from '../backend';
 import ConfirmActionModal from './ConfirmActionModal';
 
@@ -21,6 +25,14 @@ const Content: FC = () => {
   const [lastError, setLastError] = useState<string | null>(null);
   const [lastSuccess, setLastSuccess] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
+
+  const [connectionOpen, setConnectionOpen] = useState(false);
+  const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
+  const [connectionLoading, setConnectionLoading] = useState(false);
+
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [autoEject, setAutoEjectState] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -37,6 +49,13 @@ const Content: FC = () => {
       if (timerRef.current) window.clearInterval(timerRef.current);
     };
   }, [refresh]);
+
+  useEffect(() => {
+    getSettings()
+      .then((s) => setAutoEjectState(s.auto_eject))
+      .catch((e) => setLastError(String(e)))
+      .finally(() => setSettingsLoaded(true));
+  }, []);
 
   const runGuarded = async (fn: () => Promise<OpResult>) => {
     if (busy) return;
@@ -55,17 +74,23 @@ const Content: FC = () => {
     }
   };
 
+  const toggleDescription = (toEgpu: boolean): string => {
+    if (toEgpu) {
+      return "This restarts the display manager: the screen will flicker and your current session will briefly close and reopen (can take 5-15s). This is expected.";
+    }
+    if (autoEject) {
+      return "This restarts the display manager and, if an eGPU is connected, safely ejects it in the same step: the screen will flicker and your current session will briefly close and reopen (can take 5-15s). This is expected.";
+    }
+    return "This restarts the display manager: the screen will flicker and your current session will briefly close and reopen (can take 5-15s). This is expected. The eGPU is not ejected automatically here; use Eject eGPU separately before disconnecting the cable.";
+  };
+
   const confirmToggle = () => {
     if (!status) return;
     const toEgpu = !status.egpu_active;
     showModal(
       <ConfirmActionModal
         title={toEgpu ? 'Switch to eGPU?' : 'Switch to iGPU?'}
-        description={
-          toEgpu
-            ? "This restarts the display manager: the screen will flicker and your current session will briefly close and reopen (can take 5-15s). This is expected."
-            : "This restarts the display manager and, if an eGPU is connected, safely ejects it in the same step: the screen will flicker and your current session will briefly close and reopen (can take 5-15s). This is expected."
-        }
+        description={toggleDescription(toEgpu)}
         confirmText={toEgpu ? 'Switch to eGPU' : 'Switch to iGPU'}
         onConfirm={() => runGuarded(toEgpu ? enableEgpu : disableEgpu)}
       />,
@@ -110,30 +135,70 @@ const Content: FC = () => {
   // Safe to unplug whenever nothing is currently bound to the eGPU's PCI
   // slot: covers both "was never connected" and "successfully ejected while
   // the cable is still plugged in" (the device disappears from lspci either
-  // way, so no extra state needs to be tracked here).
+  // way). The two "not safe" reasons are distinguished with a sub-line so
+  // "idle but connected" doesn't read as an unexplained false alarm (this is
+  // exactly the case that confused an early tester).
   const safety = (() => {
-    if (!status?.installed || !status?.setup_done) return { color: '#94a3b8', label: 'N/A' };
-    return status.egpu_connected
-      ? { color: '#f87171', label: 'Not safe' }
-      : { color: '#4ade80', label: 'Safe' };
+    if (!status?.installed || !status?.setup_done) {
+      return { color: '#94a3b8', label: 'N/A', sub: null as string | null };
+    }
+    if (!status.egpu_connected) {
+      return { color: '#4ade80', label: 'Safe', sub: null };
+    }
+    if (status.egpu_active) {
+      return {
+        color: '#f87171',
+        label: 'Not safe (in use)',
+        sub: 'eGPU is actively driving the display.',
+      };
+    }
+    return {
+      color: '#f87171',
+      label: 'Not safe (not ejected)',
+      sub: 'eGPU is idle but not yet ejected. Press Eject eGPU before disconnecting.',
+    };
   })();
+
+  const toggleConnection = () => {
+    const next = !connectionOpen;
+    setConnectionOpen(next);
+    if (next && !connectionInfo && !connectionLoading) {
+      setConnectionLoading(true);
+      getConnectionInfo()
+        .then(setConnectionInfo)
+        .catch((e) => setLastError(String(e)))
+        .finally(() => setConnectionLoading(false));
+    }
+  };
+
+  const handleAutoEjectChange = async (checked: boolean) => {
+    setAutoEjectState(checked);
+    const res = await setAutoEject(checked);
+    if (!res.ok) {
+      setLastError(res.error ?? 'Failed to save setting');
+      setAutoEjectState(!checked);
+    }
+  };
 
   return (
     <PanelSection title="eGPU Switch">
       <PanelSectionRow>
         <Field label="Thunderbolt cable" focusable>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span
-              style={{
-                display: 'inline-block',
-                width: '10px',
-                height: '10px',
-                borderRadius: '50%',
-                backgroundColor: safety.color,
-                flexShrink: 0,
-              }}
-            />
-            <span>{safety.label}</span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span
+                style={{
+                  display: 'inline-block',
+                  width: '10px',
+                  height: '10px',
+                  borderRadius: '50%',
+                  backgroundColor: safety.color,
+                  flexShrink: 0,
+                }}
+              />
+              <span>{safety.label}</span>
+            </div>
+            {safety.sub && <span style={{ fontSize: '12px', opacity: 0.7 }}>{safety.sub}</span>}
           </div>
         </Field>
       </PanelSectionRow>
@@ -174,6 +239,69 @@ const Content: FC = () => {
           Rescan for eGPU
         </ButtonItem>
       </PanelSectionRow>
+
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={toggleConnection}>
+          {connectionOpen ? '▾ Connection' : '▸ Connection'}
+        </ButtonItem>
+      </PanelSectionRow>
+      {connectionOpen && connectionLoading && (
+        <PanelSectionRow>
+          <Field label="Connection" focusable>
+            <Spinner width="16px" height="16px" />
+          </Field>
+        </PanelSectionRow>
+      )}
+      {connectionOpen && !connectionLoading && connectionInfo && (
+        <>
+          <PanelSectionRow>
+            <Field label="PCIe link" focusable>
+              {connectionInfo.pcie_generation && connectionInfo.pcie_width
+                ? `${connectionInfo.pcie_generation} ${connectionInfo.pcie_width} (${connectionInfo.pcie_speed})`
+                : 'Not available'}
+            </Field>
+          </PanelSectionRow>
+          {connectionInfo.thunderbolt_generation && (
+            <PanelSectionRow>
+              <Field label="Thunderbolt" focusable>
+                {connectionInfo.thunderbolt_generation}
+                {connectionInfo.thunderbolt_rx_speed ? `, ${connectionInfo.thunderbolt_rx_speed}` : ''}
+              </Field>
+            </PanelSectionRow>
+          )}
+          {connectionInfo.thunderbolt_name && (
+            <PanelSectionRow>
+              <Field label="Controller" focusable>
+                {connectionInfo.thunderbolt_name}
+              </Field>
+            </PanelSectionRow>
+          )}
+        </>
+      )}
+      {connectionOpen && !connectionLoading && !connectionInfo && (
+        <PanelSectionRow>
+          <Field label="Connection" focusable>
+            Not available
+          </Field>
+        </PanelSectionRow>
+      )}
+
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setAdvancedOpen(!advancedOpen)}>
+          {advancedOpen ? '▾ Advanced' : '▸ Advanced'}
+        </ButtonItem>
+      </PanelSectionRow>
+      {advancedOpen && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Automatic eject (experimental)"
+            description="Ejects the eGPU automatically as part of Switch to iGPU, so the cable is safe to disconnect right away. Off by default: you press Eject eGPU separately. See README for a rare edge case this can hit."
+            checked={autoEject}
+            disabled={!settingsLoaded}
+            onChange={handleAutoEjectChange}
+          />
+        </PanelSectionRow>
+      )}
     </PanelSection>
   );
 };
