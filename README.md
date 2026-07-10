@@ -124,7 +124,9 @@ which GPU is currently active.
   Always asks for confirmation first, since the screen flickers and the current Deck Mode
   session briefly restarts (5-15s); this is expected. Validated on hardware: the
   gamescope session automatically routes output to the TV after the restart, with no
-  manual "arrange displays" step needed.
+  manual "arrange displays" step needed. Switching to eGPU always triggers a PCI rescan
+  first, since after an eject the eGPU is genuinely gone from `lspci` (not just slow to
+  enumerate), and `all-ways-egpu`'s own retry loop never forces a rescan on its own.
 - **Eject eGPU**: **stops the display manager** (confirmed on hardware via `fuser
   /dev/nvidia*` that gamescope, mangoapp, steam, steamwebhelper and hhd-ui keep the eGPU
   open for the whole session, even with the iGPU active, so only stopping the whole

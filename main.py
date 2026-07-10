@@ -467,6 +467,15 @@ class Plugin:
             binary = find_egpu_binary()
             if not binary:
                 return {"ok": False, "error": "all-ways-egpu binary not found on this system."}
+            if mode == "egpu":
+                # After an eject, the eGPU is genuinely gone from lspci (removed from
+                # the PCI bus), not just slow to enumerate - all-ways-egpu's own
+                # internal retry loop only re-checks lspci, it never forces a rescan,
+                # so it can never find a device that isn't on the bus at all. A rescan
+                # is safe to run unconditionally here (never removes anything, only
+                # detects new devices) and costs very little when nothing changed.
+                ok, err = write_sysfs("/sys/bus/pci/rescan", "1")
+                decky.logger.info(f"Pre-enable rescan: ok={ok} err={err!r}")
             try:
                 proc = await asyncio.to_thread(
                     subprocess.run,
