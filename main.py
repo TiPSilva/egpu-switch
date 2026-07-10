@@ -27,7 +27,14 @@ CONNECTED_NOT_PRIMARY_RE = re.compile(
     r"^([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]) "
     r"eGPU connected, not set as primary with Method 2$"
 )
-NO_EGPU_DETECTED_RE = re.compile(r"No eGPU detected")
+# Must match only the terminal give-up message, not the "No eGPU detected,
+# retry N" progress lines set-boot-vga egpu prints while it's still polling -
+# a plain substring match on "No eGPU detected" false-positives on those and
+# reports failure even when a later retry succeeds (rc=0, bind mounts set),
+# silently skipping the display manager restart. Only surfaced once the
+# auto-rescan made the retry loop actually engage instead of always
+# succeeding on the first try.
+NO_EGPU_DETECTED_RE = re.compile(r"No eGPU detected after \d+ retries")
 NO_CONFIG_RE = re.compile(r"No configuration file|not setup")
 
 # Order matters: uvm/drm/modeset depend on the base nvidia module, must unload first.
