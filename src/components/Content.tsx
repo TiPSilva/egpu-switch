@@ -14,10 +14,35 @@ import {
   rescanPci,
   restartDisplayManager,
   setAutoEject,
+  setDeepRescan,
 } from '../backend';
 import ConfirmActionModal from './ConfirmActionModal';
 
 const POLL_INTERVAL_MS = 5000;
+
+// Longest legitimate operation is Switch to eGPU with everything slow:
+// pre-rescan status read (15s) + set-boot-vga retries (45s) + display
+// manager restart (60s) ≈ 120s. Anything past 150s means the backend RPC
+// wedged (seen on hardware: a sysfs write blocking in kernel); without
+// this, `busy` never clears and every button stays disabled forever.
+const OP_TIMEOUT_MS = 150000;
+
+const withTimeout = (p: Promise<OpResult>): Promise<OpResult> =>
+  Promise.race([
+    p,
+    new Promise<OpResult>((resolve) =>
+      window.setTimeout(
+        () =>
+          resolve({
+            ok: false,
+            error:
+              'Operation timed out after 150s. The backend may still be busy or stuck; ' +
+              'check journalctl -u plugin_loader over SSH, or restart the plugin loader.',
+          }),
+        OP_TIMEOUT_MS,
+      ),
+    ),
+  ]);
 
 const Content: FC = () => {
   const [status, setStatus] = useState<EgpuStatus | null>(null);
@@ -32,6 +57,7 @@ const Content: FC = () => {
 
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [autoEject, setAutoEjectState] = useState(false);
+  const [deepRescan, setDeepRescanState] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -52,7 +78,10 @@ const Content: FC = () => {
 
   useEffect(() => {
     getSettings()
-      .then((s) => setAutoEjectState(s.auto_eject))
+      .then((s) => {
+        setAutoEjectState(s.auto_eject);
+        setDeepRescanState(s.deep_rescan);
+      })
       .catch((e) => setLastError(String(e)))
       .finally(() => setSettingsLoaded(true));
   }, []);
@@ -63,7 +92,7 @@ const Content: FC = () => {
     setLastError(null);
     setLastSuccess(null);
     try {
-      const res = await fn();
+      const res = await withTimeout(fn());
       if (!res.ok) setLastError(res.error ?? 'Unknown error');
       else if (res.message) setLastSuccess(res.message);
     } catch (e) {
@@ -177,6 +206,15 @@ const Content: FC = () => {
     if (!res.ok) {
       setLastError(res.error ?? 'Failed to save setting');
       setAutoEjectState(!checked);
+    }
+  };
+
+  const handleDeepRescanChange = async (checked: boolean) => {
+    setDeepRescanState(checked);
+    const res = await setDeepRescan(checked);
+    if (!res.ok) {
+      setLastError(res.error ?? 'Failed to save setting');
+      setDeepRescanState(!checked);
     }
   };
 
@@ -299,6 +337,17 @@ const Content: FC = () => {
             checked={autoEject}
             disabled={!settingsLoaded}
             onChange={handleAutoEjectChange}
+          />
+        </PanelSectionRow>
+      )}
+      {advancedOpen && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Deep rescan (experimental)"
+            description="Experimental. When the eGPU is missing from the PCI bus, also removes its parent PCI bridge before rescanning (briefly affects anything else on that port); does nothing extra while the eGPU is present. Only enable if the eGPU stays undetected after Eject/disconnect even with a plain rescan. See README for details."
+            checked={deepRescan}
+            disabled={!settingsLoaded}
+            onChange={handleDeepRescanChange}
           />
         </PanelSectionRow>
       )}
