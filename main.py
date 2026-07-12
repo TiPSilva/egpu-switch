@@ -305,7 +305,26 @@ def write_sysfs(path: str, value: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-DEFAULT_SETTINGS = {"auto_eject": False}
+def find_parent_bridge(bus_id: str) -> str | None:
+    """
+    Finds the PCI bridge whose secondary bus hosts bus_id, matched purely by
+    bus number - deliberately doesn't require bus_id's own sysfs device node
+    to exist, since it won't when the eGPU failed to enumerate (the exact
+    case Deep Rescan exists for: kernel refused to assign the bridge's MMIO
+    window - "can't assign; no space" in dmesg - so the device never shows
+    up at all). Every bound PCI-to-PCI bridge exposes a pci_bus/<domain:bus>
+    subdirectory for its secondary bus regardless of whether anything is
+    plugged into it, so the bridge itself is always discoverable this way.
+    """
+    target_bus = bus_id.split(":")[1].lower()
+    for path in glob.glob("/sys/bus/pci/devices/*/pci_bus/*"):
+        child_bus = os.path.basename(path).split(":")[-1].lower()
+        if child_bus == target_bus:
+            return os.path.basename(path.split("/pci_bus/")[0])
+    return None
+
+
+DEFAULT_SETTINGS = {"auto_eject": False, "deep_rescan": False}
 
 
 def get_settings_path() -> str | None:
@@ -499,6 +518,14 @@ class Plugin:
             return {"ok": False, "error": err}
         return {"ok": True}
 
+    async def set_deep_rescan(self, enabled: bool) -> dict:
+        settings = load_settings()
+        settings["deep_rescan"] = bool(enabled)
+        ok, err = save_settings(settings)
+        if not ok:
+            return {"ok": False, "error": err}
+        return {"ok": True}
+
     # ---- actions ----
 
     async def enable_egpu(self) -> dict:
@@ -575,8 +602,27 @@ class Plugin:
                     f"anything: {stop_result.get('error')}",
                 }
 
+            # wait_for guards against kernel-side stalls: when the nvidia
+            # driver is already wedged (e.g. a previous removal died with
+            # "NVRM: ... non-zero usage count"), modprobe -r blocks in
+            # uninterruptible D-state and subprocess.run's timeout cannot
+            # reap it (SIGKILL doesn't take effect in D-state, and run()
+            # then waits forever). Seen on hardware: the coroutine hung
+            # inside the try, the finally never ran, and the display
+            # manager stayed stopped - black screen with no recovery.
+            # Abandoning the stuck worker thread here is the lesser evil:
+            # the session always comes back.
             try:
-                error, removed = await unload_and_remove_pci(functions, drivers)
+                error, removed = await asyncio.wait_for(
+                    unload_and_remove_pci(functions, drivers), timeout=90
+                )
+            except asyncio.TimeoutError:
+                error, removed = (
+                    "Eject stalled in the kernel (module unload or PCI remove stuck; "
+                    "the nvidia driver may be in a bad state from an earlier failure). "
+                    "A reboot is likely required. Do NOT disconnect the eGPU.",
+                    [],
+                )
             finally:
                 start_result = await self._start_display_manager_impl()
                 decky.logger.info(f"Restart after eject: {start_result}")
@@ -601,8 +647,17 @@ class Plugin:
             }
 
     async def rescan_pci(self) -> dict:
-        """Non-destructive: only detects newly-attached PCI devices, never removes anything."""
-        ok, err = write_sysfs("/sys/bus/pci/rescan", "1")
+        """
+        Plain mode (default): only detects newly-attached PCI devices, never
+        removes anything. Deep Rescan (Advanced setting, opt-in) additionally
+        removes and re-adds the eGPU's parent PCI bridge first: on some
+        platforms that bridge is sized too small at boot for the eGPU to fit
+        ("bridge window ... can't assign; no space" in dmesg), which a plain
+        rescan can never fix since it only adds devices into an
+        already-fixed window. Off by default since removing the bridge
+        briefly affects anything else sharing that same physical port.
+        """
+        ok, err = await self._rescan_pci_impl()
         if not ok:
             return {"ok": False, "error": err}
         return {"ok": True}
@@ -615,6 +670,59 @@ class Plugin:
             return await self._restart_display_manager_impl()
 
     # ---- internals ----
+
+    async def _rescan_pci_impl(self) -> tuple[bool, str]:
+        settings = load_settings()
+        if settings.get("deep_rescan"):
+            binary = find_egpu_binary()
+            bus_id = None
+            if binary:
+                try:
+                    proc = await asyncio.to_thread(
+                        subprocess.run,
+                        [binary, "status"],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        env=clean_subprocess_env(),
+                    )
+                    bus_id = parse_status(proc.stdout or "").get("bus_id")
+                except subprocess.TimeoutExpired:
+                    pass
+            # Only remove the parent bridge when the eGPU is genuinely absent
+            # from the bus - the one case bridge removal helps (undersized
+            # bridge window blocking hot-add, "can't assign; no space").
+            # Confirmed on hardware: removing the bridge with the eGPU
+            # present and nvidia-bound tears down its children first, hits
+            # "NVRM: Attempting to remove device ... with non-zero usage
+            # count!" (gamescope/steam keep the node open even when idle on
+            # the iGPU) and the sysfs write can stall forever, wedging the
+            # RPC and the UI with it.
+            if bus_id and not os.path.exists(f"/sys/bus/pci/devices/{bus_id.lower()}"):
+                bridge = find_parent_bridge(bus_id)
+                if bridge:
+                    try:
+                        ok, err = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                write_sysfs, f"/sys/bus/pci/devices/{bridge}/remove", "1"
+                            ),
+                            timeout=20,
+                        )
+                        decky.logger.info(
+                            f"Deep rescan: remove bridge {bridge}: ok={ok} err={err!r}"
+                        )
+                    except asyncio.TimeoutError:
+                        decky.logger.error(f"Deep rescan: removing bridge {bridge} stalled")
+                        return False, (
+                            f"Deep rescan: removing PCI bridge {bridge} stalled (something "
+                            "may still be using a device behind it). Not rescanning; a "
+                            "reboot may be needed."
+                        )
+            elif bus_id:
+                decky.logger.info(
+                    "Deep rescan: eGPU still present on the bus, skipping bridge removal"
+                )
+        return write_sysfs("/sys/bus/pci/rescan", "1")
 
     async def _systemctl(self, action: str, *units: str, timeout: int = 60) -> dict:
         cmd = ["/usr/bin/systemctl", action, *units]
@@ -665,9 +773,13 @@ class Plugin:
                 # the PCI bus), not just slow to enumerate - all-ways-egpu's own
                 # internal retry loop only re-checks lspci, it never forces a rescan,
                 # so it can never find a device that isn't on the bus at all. A rescan
-                # is safe to run unconditionally here (never removes anything, only
-                # detects new devices) and costs very little when nothing changed.
-                ok, err = write_sysfs("/sys/bus/pci/rescan", "1")
+                # is safe to run unconditionally here (never removes anything by
+                # default, only detects new devices) and costs very little when
+                # nothing changed. Goes through _rescan_pci_impl so Deep Rescan
+                # (Advanced setting) also applies here, not just the standalone
+                # button - this is the exact "won't reconnect after eject" case it
+                # was added for.
+                ok, err = await self._rescan_pci_impl()
                 decky.logger.info(f"Pre-enable rescan: ok={ok} err={err!r}")
             try:
                 proc = await asyncio.to_thread(
@@ -774,7 +886,20 @@ class Plugin:
                     error = "all-ways-egpu set-boot-vga internal timed out."
 
                 if error is None and functions:
-                    error, removed = await unload_and_remove_pci(functions, drivers)
+                    # Same D-state stall guard as eject_egpu(): the finally
+                    # below must always be reached so the session comes back.
+                    try:
+                        error, removed = await asyncio.wait_for(
+                            unload_and_remove_pci(functions, drivers), timeout=90
+                        )
+                    except asyncio.TimeoutError:
+                        error, removed = (
+                            "Eject stalled in the kernel (module unload or PCI remove "
+                            "stuck; the nvidia driver may be in a bad state from an "
+                            "earlier failure). A reboot is likely required. Do NOT "
+                            "disconnect the eGPU.",
+                            [],
+                        )
             finally:
                 start_result = await self._start_display_manager_impl()
                 decky.logger.info(f"Restart after switch-to-iGPU: {start_result}")

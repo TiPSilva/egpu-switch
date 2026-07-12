@@ -32,6 +32,7 @@ export interface ConnectionInfo {
 
 export interface Settings {
   auto_eject: boolean;
+  deep_rescan: boolean;
 }
 
 export const getStatus = () => call<[], EgpuStatus>('get_status');
@@ -43,3 +44,4 @@ export const rescanPci = () => call<[], OpResult>('rescan_pci');
 export const getConnectionInfo = () => call<[], ConnectionInfo>('get_connection_info');
 export const getSettings = () => call<[], Settings>('get_settings');
 export const setAutoEject = (enabled: boolean) => call<[boolean], OpResult>('set_auto_eject', enabled);
+export const setDeepRescan = (enabled: boolean) => call<[boolean], OpResult>('set_deep_rescan', enabled);
