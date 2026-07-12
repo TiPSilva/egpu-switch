@@ -158,7 +158,9 @@ Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
 - **Rescan for eGPU**: `echo 1 > /sys/bus/pci/rescan`. Removes nothing, just forces a new
   PCI device detection pass. Normally unnecessary (reconnecting the Thunderbolt cable
   already triggers automatic hotplug), but serves as manual recovery if the eGPU doesn't
-  reappear on its own after being reconnected.
+  reappear on its own after being reconnected. Also runs automatically before **Switch to
+  eGPU**. If **Deep Rescan** (see **Advanced** below) is enabled, both of these also remove
+  and re-add the eGPU's parent PCI bridge first.
 - **Connection** (collapsed by default): fetched on demand, only when you expand it, since
   it costs a couple of extra subprocess calls not worth paying on every 5s status poll.
   Shows the negotiated PCIe link speed/width (works for any connection type, including
@@ -171,6 +173,20 @@ Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
     also ejects the eGPU automatically in the same operation, one flicker instead of two
     separate steps. See [Known limitation](#known-limitation-nvidia-driver-hot-unplug)
     below for why this stays opt-in rather than becoming the default.
+  - **Deep rescan (experimental)**: off by default. On some platforms, the eGPU's PCI
+    bridge (the Thunderbolt/USB4 tunnel's downstream port) gets sized too small at boot for
+    the eGPU's memory windows to fit once hot-added, so a plain rescan fails to bring it
+    back after an eject or physical disconnect (`dmesg` shows `bridge window ...: can't
+    assign; no space`). When enabled, both **Rescan for eGPU** and the automatic pre-rescan
+    before **Switch to eGPU** first remove and re-add that parent bridge (discovered
+    dynamically from the eGPU's configured bus ID, not hardcoded), letting the kernel
+    recompute the window before rescanning. The bridge removal only happens when the eGPU
+    is actually **absent** from the PCI bus - the only case it helps. With the eGPU present
+    it falls back to a plain rescan: confirmed on hardware that removing the bridge under a
+    present, nvidia-bound eGPU tears its devices down while still open (`NVRM: Attempting
+    to remove device ... with non-zero usage count!`) and can wedge the operation. Stays
+    opt-in because removing the bridge briefly affects anything else tunneled through that
+    same physical port.
 
 ## Known limitation: NVIDIA driver hot-unplug
 
@@ -222,6 +238,15 @@ process was killed, not the display manager), also run:
 ```sh
 sudo systemctl start plugin_loader
 ```
+
+### Known limitation: HDMI audio after eject + reconnect
+
+After an eject followed by a reconnect (or rescan), the eGPU's HDMI audio function can
+come back non-functional: the kernel re-probes it but logs `snd_hda_intel ...: GPU sound
+probed, but not operational: please add a quirk to driver_denylist`. Video works normally;
+only audio through the eGPU's own outputs is affected until a reboot. This is a kernel
+`snd_hda_intel` limitation with re-hotplugged GPU audio functions, not something the
+plugin controls. Observed on both test setups (Bazzite/AyaNeo and CachyOS/ROG Xbox Ally).
 
 ## Testing safely
 
