@@ -344,7 +344,7 @@ const Content: FC = () => {
         <PanelSectionRow>
           <ToggleField
             label="Deep rescan (experimental)"
-            description="Experimental. When the eGPU is missing from the PCI bus, also removes its parent PCI bridge before rescanning (briefly affects anything else on that port); does nothing extra while the eGPU is present. Only enable if the eGPU stays undetected after Eject/disconnect even with a plain rescan. See README for details."
+            description="Experimental. When the eGPU is not detected as working (missing from the bus, or re-added broken after an eject), also removes its parent PCI bridge before rescanning (briefly affects anything else on that port); does nothing extra while the eGPU is working. Only enable if the eGPU stays undetected after Eject/disconnect even with a plain rescan. See README for details."
             checked={deepRescan}
             disabled={!settingsLoaded}
             onChange={handleDeepRescanChange}

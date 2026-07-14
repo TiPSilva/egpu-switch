@@ -180,11 +180,15 @@ Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
     assign; no space`). When enabled, both **Rescan for eGPU** and the automatic pre-rescan
     before **Switch to eGPU** first remove and re-add that parent bridge (discovered
     dynamically from the eGPU's configured bus ID, not hardcoded), letting the kernel
-    recompute the window before rescanning. The bridge removal only happens when the eGPU
-    is actually **absent** from the PCI bus - the only case it helps. With the eGPU present
+    recompute the window before rescanning. The bridge removal only happens when
+    `all-ways-egpu` does **not** see the eGPU as connected and no driver is bound to any of
+    its functions - this covers both "genuinely absent from the bus" and "re-added as a
+    broken, half-enumerated node after an eject" (tester hardware confirmed the hotplug can
+    re-add a zombie whose sysfs path exists but that has no usable `boot_vga`, so a bare
+    existence check skipped the removal exactly when it was needed). With the eGPU working,
     it falls back to a plain rescan: confirmed on hardware that removing the bridge under a
-    present, nvidia-bound eGPU tears its devices down while still open (`NVRM: Attempting
-    to remove device ... with non-zero usage count!`) and can wedge the operation. Stays
+    live, nvidia-bound eGPU tears its devices down while still open (`NVRM: Attempting to
+    remove device ... with non-zero usage count!`) and can wedge the operation. Stays
     opt-in because removing the bridge briefly affects anything else tunneled through that
     same physical port.
 
