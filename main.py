@@ -676,6 +676,7 @@ class Plugin:
         if settings.get("deep_rescan"):
             binary = find_egpu_binary()
             bus_id = None
+            egpu_connected = False
             if binary:
                 try:
                     proc = await asyncio.to_thread(
@@ -686,41 +687,59 @@ class Plugin:
                         timeout=15,
                         env=clean_subprocess_env(),
                     )
-                    bus_id = parse_status(proc.stdout or "").get("bus_id")
+                    parsed = parse_status(proc.stdout or "")
+                    bus_id = parsed.get("bus_id")
+                    egpu_connected = bool(parsed.get("egpu_connected"))
                 except subprocess.TimeoutExpired:
                     pass
-            # Only remove the parent bridge when the eGPU is genuinely absent
-            # from the bus - the one case bridge removal helps (undersized
-            # bridge window blocking hot-add, "can't assign; no space").
-            # Confirmed on hardware: removing the bridge with the eGPU
-            # present and nvidia-bound tears down its children first, hits
-            # "NVRM: Attempting to remove device ... with non-zero usage
-            # count!" (gamescope/steam keep the node open even when idle on
-            # the iGPU) and the sysfs write can stall forever, wedging the
-            # RPC and the UI with it.
-            if bus_id and not os.path.exists(f"/sys/bus/pci/devices/{bus_id.lower()}"):
-                bridge = find_parent_bridge(bus_id)
-                if bridge:
-                    try:
-                        ok, err = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                write_sysfs, f"/sys/bus/pci/devices/{bridge}/remove", "1"
-                            ),
-                            timeout=20,
-                        )
-                        decky.logger.info(
-                            f"Deep rescan: remove bridge {bridge}: ok={ok} err={err!r}"
-                        )
-                    except asyncio.TimeoutError:
-                        decky.logger.error(f"Deep rescan: removing bridge {bridge} stalled")
-                        return False, (
-                            f"Deep rescan: removing PCI bridge {bridge} stalled (something "
-                            "may still be using a device behind it). Not rescanning; a "
-                            "reboot may be needed."
-                        )
+            # Only remove the parent bridge when all-ways-egpu does NOT see
+            # the eGPU as connected - the functional check, not a bare sysfs
+            # existence check. Confirmed on tester hardware (Strix Halo /
+            # CachyOS): after an eject, automatic hotplug can re-add a
+            # half-enumerated zombie node (the "bridge window ... can't
+            # assign; no space" case) whose sysfs path exists but that has
+            # no usable boot_vga, so an existence check skips the bridge
+            # removal exactly when it's needed. As a second safety belt,
+            # still skip if any function under the slot has a driver bound:
+            # removing the bridge under a live nvidia-bound GPU was
+            # confirmed on hardware to hit "NVRM: Attempting to remove
+            # device ... with non-zero usage count!" and wedge the op
+            # (gamescope/steam keep the node open even idle on the iGPU).
+            if bus_id and not egpu_connected:
+                slot = bus_id.rsplit(".", 1)[0].lower()
+                bound = [
+                    os.path.basename(f)
+                    for f in glob.glob(f"/sys/bus/pci/devices/{slot}.*")
+                    if get_pci_driver(os.path.basename(f))
+                ]
+                if bound:
+                    decky.logger.info(
+                        f"Deep rescan: functions still driver-bound ({bound}), "
+                        "skipping bridge removal"
+                    )
+                else:
+                    bridge = find_parent_bridge(bus_id)
+                    if bridge:
+                        try:
+                            ok, err = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    write_sysfs, f"/sys/bus/pci/devices/{bridge}/remove", "1"
+                                ),
+                                timeout=20,
+                            )
+                            decky.logger.info(
+                                f"Deep rescan: remove bridge {bridge}: ok={ok} err={err!r}"
+                            )
+                        except asyncio.TimeoutError:
+                            decky.logger.error(f"Deep rescan: removing bridge {bridge} stalled")
+                            return False, (
+                                f"Deep rescan: removing PCI bridge {bridge} stalled (something "
+                                "may still be using a device behind it). Not rescanning; a "
+                                "reboot may be needed."
+                            )
             elif bus_id:
                 decky.logger.info(
-                    "Deep rescan: eGPU still present on the bus, skipping bridge removal"
+                    "Deep rescan: eGPU connected and functional, skipping bridge removal"
                 )
         return write_sysfs("/sys/bus/pci/rescan", "1")
 
