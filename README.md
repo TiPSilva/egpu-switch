@@ -243,14 +243,25 @@ process was killed, not the display manager), also run:
 sudo systemctl start plugin_loader
 ```
 
-### Known limitation: HDMI audio after eject + reconnect
+### HDMI audio after eject + reconnect
 
 After an eject followed by a reconnect (or rescan), the eGPU's HDMI audio function can
 come back non-functional: the kernel re-probes it but logs `snd_hda_intel ...: GPU sound
 probed, but not operational: please add a quirk to driver_denylist`. Video works normally;
-only audio through the eGPU's own outputs is affected until a reboot. This is a kernel
-`snd_hda_intel` limitation with re-hotplugged GPU audio functions, not something the
-plugin controls. Observed on both test setups (Bazzite/AyaNeo and CachyOS/ROG Xbox Ally).
+only audio through the eGPU's own outputs is affected. This is a kernel `snd_hda_intel`
+limitation with re-hotplugged GPU audio functions. Observed on both test setups
+(Bazzite/AyaNeo and CachyOS/ROG Xbox Ally).
+
+Confirmed fix on hardware: unbinding and rebinding the audio function on `snd_hda_intel`
+restores audio, no cable replug or reboot needed. The plugin does this **automatically**
+whenever one of its own rescans actually re-adds the eGPU (it was absent or broken before
+the rescan); a rescan over an already-healthy eGPU never touches audio. If audio breaks
+through some other path (e.g. a purely physical replug, where the kernel hotplug re-adds
+the device without the plugin involved), the manual equivalent over SSH is:
+
+```sh
+sudo sh -c 'echo <bus_id>.1 > /sys/bus/pci/drivers/snd_hda_intel/unbind && sleep 1 && echo <bus_id>.1 > /sys/bus/pci/drivers/snd_hda_intel/bind'
+```
 
 ## Testing safely
 

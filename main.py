@@ -305,6 +305,50 @@ def write_sysfs(path: str, value: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+async def rebind_egpu_audio(slot: str) -> None:
+    """
+    After a rescan re-adds the eGPU, its HDMI audio sibling re-probes as
+    "GPU sound probed, but not operational" (kernel snd_hda_intel
+    limitation with re-hotplugged GPU audio - video is unaffected).
+    Confirmed on hardware: an unbind/rebind of the audio function restores
+    audio, no cable replug or reboot needed - but only once the video side
+    is actually up. Rebinding immediately after re-enumeration (~1s, also
+    tried on hardware) re-probes the codec before the video driver has
+    brought the HDMI link up and it stays non-operational; the same rebind
+    minutes later, with the display live, works. So: wait for the video
+    function to have a driver and a DRM node, give the link a settle
+    delay, then rebind. Best-effort, silently gives up on timeout (e.g.
+    eGPU with no audio function, or slow Thunderbolt re-auth).
+    """
+    video_fn = f"{slot}.0"
+    audio_fn = f"{slot}.1"
+    for _ in range(20):
+        if get_pci_driver(video_fn) and glob.glob(
+            f"/sys/bus/pci/devices/{video_fn}/drm/card*"
+        ):
+            break
+        await asyncio.sleep(1)
+    else:
+        decky.logger.info(
+            f"Audio rebind: video function {video_fn} has no driver/DRM node yet, skipping"
+        )
+        return
+    # HDMI link training and the compositor grabbing the new output take a
+    # moment after the DRM node appears; rebinding before that was the
+    # too-early failure mode seen on hardware.
+    await asyncio.sleep(5)
+    if get_pci_driver(audio_fn) != "snd_hda_intel":
+        decky.logger.info(f"Audio rebind: {audio_fn} not bound to snd_hda_intel, skipping")
+        return
+    ok, err = write_sysfs("/sys/bus/pci/drivers/snd_hda_intel/unbind", audio_fn)
+    decky.logger.info(f"Audio rebind: unbind {audio_fn}: ok={ok} err={err!r}")
+    if not ok:
+        return
+    await asyncio.sleep(1)
+    ok, err = write_sysfs("/sys/bus/pci/drivers/snd_hda_intel/bind", audio_fn)
+    decky.logger.info(f"Audio rebind: bind {audio_fn}: ok={ok} err={err!r}")
+
+
 def find_parent_bridge(bus_id: str) -> str | None:
     """
     Finds the PCI bridge whose secondary bus hosts bus_id, matched purely by
@@ -673,25 +717,25 @@ class Plugin:
 
     async def _rescan_pci_impl(self) -> tuple[bool, str]:
         settings = load_settings()
+        binary = find_egpu_binary()
+        bus_id = None
+        egpu_connected = False
+        if binary:
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    [binary, "status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=clean_subprocess_env(),
+                )
+                parsed = parse_status(proc.stdout or "")
+                bus_id = parsed.get("bus_id")
+                egpu_connected = bool(parsed.get("egpu_connected"))
+            except subprocess.TimeoutExpired:
+                pass
         if settings.get("deep_rescan"):
-            binary = find_egpu_binary()
-            bus_id = None
-            egpu_connected = False
-            if binary:
-                try:
-                    proc = await asyncio.to_thread(
-                        subprocess.run,
-                        [binary, "status"],
-                        capture_output=True,
-                        text=True,
-                        timeout=15,
-                        env=clean_subprocess_env(),
-                    )
-                    parsed = parse_status(proc.stdout or "")
-                    bus_id = parsed.get("bus_id")
-                    egpu_connected = bool(parsed.get("egpu_connected"))
-                except subprocess.TimeoutExpired:
-                    pass
             # Only remove the parent bridge when all-ways-egpu does NOT see
             # the eGPU as connected - the functional check, not a bare sysfs
             # existence check. Confirmed on tester hardware (Strix Halo /
@@ -741,7 +785,16 @@ class Plugin:
                 decky.logger.info(
                     "Deep rescan: eGPU connected and functional, skipping bridge removal"
                 )
-        return write_sysfs("/sys/bus/pci/rescan", "1")
+        ok, err = write_sysfs("/sys/bus/pci/rescan", "1")
+        # If this rescan is (re-)adding the eGPU (it was absent or broken
+        # before), its HDMI audio function will re-probe as "not
+        # operational"; rebind it once it enumerates. Runs regardless of
+        # the deep_rescan setting: the audio bug follows any re-add, not
+        # just bridge recovery. Skipped when the eGPU was already healthy,
+        # so a no-op rescan never disturbs working audio.
+        if ok and bus_id and not egpu_connected:
+            await rebind_egpu_audio(bus_id.rsplit(".", 1)[0].lower())
+        return ok, err
 
     async def _systemctl(self, action: str, *units: str, timeout: int = 60) -> dict:
         cmd = ["/usr/bin/systemctl", action, *units]

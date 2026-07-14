@@ -21,11 +21,12 @@ import ConfirmActionModal from './ConfirmActionModal';
 const POLL_INTERVAL_MS = 5000;
 
 // Longest legitimate operation is Switch to eGPU with everything slow:
-// pre-rescan status read (15s) + set-boot-vga retries (45s) + display
-// manager restart (60s) ≈ 120s. Anything past 150s means the backend RPC
-// wedged (seen on hardware: a sysfs write blocking in kernel); without
-// this, `busy` never clears and every button stays disabled forever.
-const OP_TIMEOUT_MS = 150000;
+// pre-rescan status read (15s) + bridge removal (20s) + audio rebind wait
+// (~27s) + set-boot-vga retries (45s) + display manager restart (60s)
+// ≈ 170s. Anything past 240s means the backend RPC wedged (seen on
+// hardware: a sysfs write blocking in kernel); without this, `busy` never
+// clears and every button stays disabled forever.
+const OP_TIMEOUT_MS = 240000;
 
 const withTimeout = (p: Promise<OpResult>): Promise<OpResult> =>
   Promise.race([
@@ -36,7 +37,7 @@ const withTimeout = (p: Promise<OpResult>): Promise<OpResult> =>
           resolve({
             ok: false,
             error:
-              'Operation timed out after 150s. The backend may still be busy or stuck; ' +
+              'Operation timed out after 240s. The backend may still be busy or stuck; ' +
               'check journalctl -u plugin_loader over SSH, or restart the plugin loader.',
           }),
         OP_TIMEOUT_MS,
