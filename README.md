@@ -61,6 +61,17 @@ pnpm run build   # generates dist/index.js
 pnpm run zip     # also packages out/egpu-switch.zip, ready to install via the flow above
 ```
 
+The backend logic that is dangerous when wrong (the guard that refuses to detach a PCI
+device with mounted storage behind it, the parser deciding which Thunderbolt device gets
+authorized, and the `all-ways-egpu status` parsing everything else reads from) has a
+dependency-free self-check:
+
+```sh
+python3 tests/selfcheck.py
+```
+
+Everything else talks to real hardware and is validated on the device instead.
+
 ## Manual deploy over SSH (development)
 
 Useful for scripting redeploys while working on the plugin itself (this is what the rest
@@ -152,7 +163,10 @@ Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
   **Required before physically disconnecting the Thunderbolt cable**, see the section
   below. If something is still using the card, the operation aborts without removing
   anything (but the session is always restarted regardless, even on error, so the screen
-  never gets stuck with no session at all).
+  never gets stuck with no session at all). It also refuses upfront, before touching the
+  session at all, when a mounted filesystem lives behind any of the eGPU's PCI functions:
+  some cards expose a USB controller of their own, and detaching the function would pull
+  that storage out mid-write.
 - **Restart Display Manager (recovery)**: only restarts the display manager, without
   touching the boot VGA configuration. Useful for unsticking a bad display state.
 - **Rescan for eGPU**: `echo 1 > /sys/bus/pci/rescan`. Removes nothing, just forces a new
@@ -188,9 +202,12 @@ Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
     existence check skipped the removal exactly when it was needed). With the eGPU working,
     it falls back to a plain rescan: confirmed on hardware that removing the bridge under a
     live, nvidia-bound eGPU tears its devices down while still open (`NVRM: Attempting to
-    remove device ... with non-zero usage count!`) and can wedge the operation. Stays
-    opt-in because removing the bridge briefly affects anything else tunneled through that
-    same physical port.
+    remove device ... with non-zero usage count!`) and can wedge the operation. It is also
+    skipped, falling back to a plain rescan, when a mounted filesystem lives behind that
+    bridge: the removal would take the whole subtree down with it, so an enclosure that
+    carries an NVMe or a USB storage controller alongside the GPU would lose it mid-write.
+    Stays opt-in because removing the bridge briefly affects anything else tunneled
+    through that same physical port.
 
 ## Known limitation: NVIDIA driver hot-unplug
 
