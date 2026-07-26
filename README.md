@@ -287,6 +287,29 @@ plugin involved), the manual equivalent over SSH is:
 sudo sh -c 'echo <bus_id>.1 > /sys/bus/pci/drivers/snd_hda_intel/unbind && sleep 1 && echo <bus_id>.1 > /sys/bus/pci/drivers/snd_hda_intel/bind'
 ```
 
+### Freezing on boot or on sleep/wake with the eGPU connected (AMD platforms)
+
+If the whole system (not just the display) hangs when powering on with the eGPU already
+attached, or when waking from sleep with it active, try adding the `thunderbolt.host_reset=0`
+kernel parameter (a module option added in kernel 6.12+, with known regressions on some AMD
+Ryzen platforms). Confirmed on hardware to fix both cases outright, including sleep with the
+eGPU actively driving the display, not just a workaround. On Bazzite/SteamOS-style atomic
+systems, kernel arguments are managed with `rpm-ostree`, not by editing GRUB directly:
+
+```sh
+sudo rpm-ostree kargs --append-if-missing=thunderbolt.host_reset=0
+systemctl reboot
+```
+
+To confirm it applied: `cat /proc/cmdline | grep host_reset`. To revert:
+`sudo rpm-ostree kargs --delete=thunderbolt.host_reset=0` and reboot again. ostree-based
+systems keep the previous deployment as a rollback option in the boot menu if something
+goes wrong.
+
+Only confirmed on an AMD Ryzen 7840U (Phoenix) system so far; if it doesn't help on your
+hardware, powering on without the eGPU and connecting after boot (regular hotplug) remains
+a reliable fallback.
+
 ## Testing safely
 
 Keep an SSH session open to the device while testing. If the gamescope session doesn't
