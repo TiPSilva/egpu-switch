@@ -63,8 +63,9 @@ pnpm run zip     # also packages out/egpu-switch.zip, ready to install via the f
 
 The backend logic that is dangerous when wrong (the guard that refuses to detach a PCI
 device with mounted storage behind it, the parser deciding which Thunderbolt device gets
-authorized, and the `all-ways-egpu status` parsing everything else reads from) has a
-dependency-free self-check:
+authorized, the check deciding whether the eGPU's audio actually needs a rebind, and the
+`all-ways-egpu status` parsing everything else reads from) has a dependency-free
+self-check:
 
 ```sh
 python3 tests/selfcheck.py
@@ -271,10 +272,16 @@ limitation with re-hotplugged GPU audio functions. Observed on both test setups
 
 Confirmed fix on hardware: unbinding and rebinding the audio function on `snd_hda_intel`
 restores audio, no cable replug or reboot needed. The plugin does this **automatically**
-whenever one of its own rescans actually re-adds the eGPU (it was absent or broken before
-the rescan); a rescan over an already-healthy eGPU never touches audio. If audio breaks
-through some other path (e.g. a purely physical replug, where the kernel hotplug re-adds
-the device without the plugin involved), the manual equivalent over SSH is:
+after every rescan (the standalone button and the automatic one before **Switch to
+eGPU**), by checking the audio card's own ELD (`monitor_present`/`eld_valid` under
+`/proc/asound`) rather than assuming "the eGPU was already connected" means "audio must be
+fine too": those turned out to be unrelated on hardware, since automatic Thunderbolt
+hotplug can re-add the eGPU (and break its audio) before the user ever presses anything,
+which an earlier version of this check missed entirely. The ELD check is a couple of
+instant file reads, so a rescan over already-healthy audio pays nothing; only a genuinely
+broken codec gets the settle-and-rebind sequence. If audio breaks through some other path
+(e.g. a purely physical replug, where the kernel hotplug re-adds the device without the
+plugin involved), the manual equivalent over SSH is:
 
 ```sh
 sudo sh -c 'echo <bus_id>.1 > /sys/bus/pci/drivers/snd_hda_intel/unbind && sleep 1 && echo <bus_id>.1 > /sys/bus/pci/drivers/snd_hda_intel/bind'

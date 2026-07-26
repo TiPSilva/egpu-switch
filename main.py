@@ -469,20 +469,70 @@ def write_sysfs(path: str, value: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _eld_field(eld_file: str, key: str) -> int | None:
+    content = _read_sysfs(eld_file)
+    if content is None:
+        return None
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == key:
+            try:
+                return int(parts[1])
+            except ValueError:
+                return None
+    return None
+
+
+def audio_eld_healthy(audio_fn: str, sysfs: str = "/sys", proc_asound: str = "/proc/asound") -> bool:
+    """
+    True when the ALSA card behind this HDMI/DP audio PCI function reports a
+    valid ELD (the display's advertised audio capabilities) for a monitor it
+    currently sees as present.
+
+    This exists because "does the eGPU need a rescan" and "is its audio
+    actually working" turned out to be unrelated questions, confirmed on
+    hardware: after an eject, automatic Thunderbolt hotplug can re-add the
+    eGPU on its own before the user ever presses anything, so by the time
+    Switch to eGPU's pre-rescan runs, all-ways-egpu already reports it
+    connected. The old logic used that as "no rescan was needed, so audio
+    must be fine too" and skipped the rebind outright - but the video
+    function being present says nothing about whether the audio codec's
+    probe (which runs on its own PCI re-enumeration, independent of
+    anything all-ways-egpu tracks) actually completed cleanly. Restarting
+    the display manager doesn't touch this either, which is why that never
+    helped: the failure is below the session, in the HDA codec itself.
+
+    A card reporting monitor_present without eld_valid is exactly the
+    broken state (`GPU sound probed, but not operational` in dmesg); no pin
+    reporting monitor_present at all, once the caller has independently
+    confirmed a DRM connector is connected, is the same mismatch by another
+    name and also treated as unhealthy.
+    """
+    cards = glob.glob(f"{sysfs}/bus/pci/devices/{audio_fn}/sound/card*")
+    if not cards:
+        return False
+    card_num = os.path.basename(cards[0])[len("card") :]
+    for eld_file in glob.glob(f"{proc_asound}/card{card_num}/eld#*"):
+        if _eld_field(eld_file, "monitor_present") == 1:
+            return _eld_field(eld_file, "eld_valid") == 1
+    return False
+
+
 async def rebind_egpu_audio(slot: str) -> None:
     """
-    After a rescan re-adds the eGPU, its HDMI audio sibling re-probes as
-    "GPU sound probed, but not operational" (kernel snd_hda_intel
-    limitation with re-hotplugged GPU audio - video is unaffected).
-    Confirmed on hardware: an unbind/rebind of the audio function restores
-    audio, no cable replug or reboot needed - but only once the video side
-    is actually up. Rebinding immediately after re-enumeration (~1s, also
-    tried on hardware) re-probes the codec before the video driver has
-    brought the HDMI link up and it stays non-operational; the same rebind
-    minutes later, with the display live, works. So: wait for the video
-    function to have a driver and a DRM node, give the link a settle
-    delay, then rebind. Best-effort, silently gives up on timeout (e.g.
-    eGPU with no audio function, or slow Thunderbolt re-auth).
+    After a PCI re-enumeration of the eGPU (any of them, whether triggered
+    by this plugin's own rescan or by automatic Thunderbolt hotplug the
+    plugin never saw happen), its HDMI audio sibling can re-probe as "GPU
+    sound probed, but not operational" (kernel snd_hda_intel limitation
+    with re-hotplugged GPU audio; video is unaffected). Confirmed on
+    hardware: an unbind/rebind of the audio function restores it, no cable
+    replug or reboot needed, but only once the video side is actually up
+    and only when it is genuinely broken (see audio_eld_healthy).
+
+    Cheap in the common case: if audio is already healthy, this returns
+    after a couple of instant file reads, no sleep at all. The slow path
+    (settle delay, unbind, rebind) only runs when the ELD check finds the
+    codec in the broken state.
     """
     video_fn = f"{slot}.0"
     audio_fn = f"{slot}.1"
@@ -516,16 +566,14 @@ async def rebind_egpu_audio(slot: str) -> None:
             f"Audio rebind: no connected display on {video_fn}, nothing to repair"
         )
         return
+    if audio_eld_healthy(audio_fn):
+        decky.logger.info(f"Audio rebind: {audio_fn} already reports a valid ELD, skipping")
+        return
     # Settle after the connector is up: the codec still needs a moment to
     # take the ELD. Kept at the value validated on hardware, so the rebind
     # can only ever land later than the timing that was confirmed working,
-    # never earlier (rebinding too early is the known failure mode).
-    #
-    # ponytail: a calibration constant, not a derived one. Ceiling: a slower
-    # display could still need more than 5s and would silently keep dead
-    # audio. Upgrade path: poll the codec's own eld_valid under
-    # /proc/asound/card*/eld* instead of sleeping, once there is hardware to
-    # calibrate that against.
+    # never earlier (rebinding too early is the known failure mode). Only
+    # paid once the ELD check above already decided a rebind is warranted.
     await asyncio.sleep(5)
     if get_pci_driver(audio_fn) != "snd_hda_intel":
         decky.logger.info(f"Audio rebind: {audio_fn} not bound to snd_hda_intel, skipping")
@@ -1050,14 +1098,18 @@ class Plugin:
         if bus_id and not egpu_connected:
             await reauthorize_thunderbolt_tunnel()
         ok, err = write_sysfs("/sys/bus/pci/rescan", "1")
-        # If this rescan is (re-)adding the eGPU (it was absent or broken
-        # before), its HDMI audio function will re-probe as "not
-        # operational" and needs a rebind. Report the slot instead of doing
-        # it here: the right moment depends on the caller (a switch restarts
-        # the display manager afterwards, and the rebind has to come after
-        # that). Stays None when the eGPU was already healthy, so a no-op
-        # rescan never disturbs working audio.
-        slot_to_rebind = bus_id.rsplit(".", 1)[0].lower() if (ok and bus_id and not egpu_connected) else None
+        # Always report the slot for the caller to check, regardless of
+        # whether the eGPU was already connected before this rescan ran.
+        # Confirmed on hardware that "not egpu_connected" is the wrong gate
+        # here: automatic Thunderbolt hotplug can re-add the eGPU on its own
+        # before the user presses anything, so by the time this runs,
+        # all-ways-egpu can already report it connected even though its
+        # audio function never got a working ELD from that same
+        # re-enumeration. rebind_egpu_audio() is cheap to call when
+        # everything is already fine (a couple of instant file reads, no
+        # sleep), so there is no cost to checking on every rescan instead of
+        # only the ones this code used to think were necessary.
+        slot_to_rebind = bus_id.rsplit(".", 1)[0].lower() if (ok and bus_id) else None
         return ok, err, slot_to_rebind
 
     async def _systemctl(self, action: str, *units: str, timeout: int = 60) -> dict:

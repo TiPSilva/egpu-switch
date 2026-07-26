@@ -5,13 +5,17 @@ fixtures, no dependencies:
 
     python3 tests/selfcheck.py
 
-Covers three pure functions:
+Covers four pure functions:
 
   mounted_storage_under        refuses an eject that would yank a mounted disk
                                out of the enclosure, so a false "nothing
                                mounted" costs data
   devices_needing_authorization decides which Thunderbolt device gets DMA
                                access, so a false positive is a security hole
+  audio_eld_healthy            decides whether to touch a working audio
+                               device; a false "healthy" leaves dead audio
+                               unrepaired, a false "unhealthy" glitches sound
+                               that was already fine
   parse_status                 every other decision reads from it
 
 Everything else in main.py talks to real hardware and is validated on the
@@ -30,6 +34,7 @@ sys.modules["decky"].logger = type(
 )()
 
 from main import (  # noqa: E402
+    audio_eld_healthy,
     devices_needing_authorization,
     mounted_storage_under,
     parse_status,
@@ -162,6 +167,47 @@ check(
     "storage: unreadable mounts file fails closed to empty, never crashes",
     mounted_storage_under("0000:65:00.0", root, "/nonexistent"),
     [],
+)
+
+# --- audio_eld_healthy -----------------------------------------------------
+# Fake /sys/bus/pci/devices/<audio_fn>/sound/cardN and a matching
+# /proc/asound/cardN/eld#*, mirroring the real ALSA layout for an HDMI/DP
+# audio function with several pins (most idle, one carrying a monitor).
+audio_root = tempfile.mkdtemp()
+os.makedirs(f"{audio_root}/bus/pci/devices/0000:66:00.1/sound/card2")
+proc_asound = tempfile.mkdtemp()
+os.makedirs(f"{proc_asound}/card2")
+
+
+def write_eld(card, pin, monitor_present, eld_valid):
+    with open(f"{proc_asound}/card{card}/eld#{pin}", "w") as f:
+        f.write(f"monitor_present\t\t{monitor_present}\neld_valid\t\t{eld_valid}\n")
+
+
+write_eld(2, "0.1", 0, 0)  # idle pin, never connected
+check(
+    "audio: no PCI function at all -> unhealthy",
+    audio_eld_healthy("0000:99:99.9", audio_root, proc_asound),
+    False,
+)
+check(
+    "audio: a card exists but no pin has ever seen a monitor -> unhealthy",
+    audio_eld_healthy("0000:66:00.1", audio_root, proc_asound),
+    False,
+)
+
+write_eld(2, "0.0", 1, 0)  # exactly the reported bug: monitor seen, ELD invalid
+check(
+    "audio: monitor present but ELD invalid is the broken state that needs a rebind",
+    audio_eld_healthy("0000:66:00.1", audio_root, proc_asound),
+    False,
+)
+
+write_eld(2, "0.0", 1, 1)  # matches the real LG TV pin captured on hardware
+check(
+    "audio: monitor present with a valid ELD is healthy, no rebind needed",
+    audio_eld_healthy("0000:66:00.1", audio_root, proc_asound),
+    True,
 )
 
 # --- report ---------------------------------------------------------------
