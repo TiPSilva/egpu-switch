@@ -1,3 +1,8 @@
+# Defers annotation evaluation, so `str | None` no longer needs the host to be
+# Python 3.10+ just to import this module. Decky's runtime is newer than that,
+# but tests/selfcheck.py has to import it on whatever python is around.
+from __future__ import annotations
+
 import asyncio
 import glob
 import json
@@ -151,32 +156,21 @@ def resolve_host_uid() -> int:
         return 1000
 
 
-async def list_pci_functions(slot: str) -> list[str]:
-    """List every PCI function (e.g. GPU + its HDMI audio sibling) under a
-    domain:bus:device slot, so eject can safely detach all of them, not just
-    the single VGA function all-ways-egpu tracks in egpu-bus-ids."""
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.run,
-            ["lspci", "-D", "-s", slot],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=clean_subprocess_env(),
-        )
-    except Exception:
-        return []
-    if proc.returncode != 0:
-        return []
-    functions: list[str] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        bus = line.split(" ", 1)[0]
-        if re.match(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$", bus):
-            functions.append(bus)
-    return functions
+def list_pci_functions(slot: str) -> list[str]:
+    """
+    Every PCI function under a domain:bus:device slot (the GPU, its HDMI
+    audio sibling, sometimes a USB controller), so eject detaches all of them
+    and not just the single VGA function all-ways-egpu tracks in
+    egpu-bus-ids.
+
+    Reads sysfs rather than shelling out to lspci: the same glob already
+    backs the Deep rescan guard, it costs no subprocess, and lspci can block
+    on a device whose driver is wedged, which is precisely the state eject
+    has to work in. Sorted so the video function comes before its siblings.
+    """
+    return sorted(
+        os.path.basename(p) for p in glob.glob(f"/sys/bus/pci/devices/{slot}.*")
+    )
 
 
 def get_pci_driver(bus_id: str) -> str | None:
@@ -184,6 +178,68 @@ def get_pci_driver(bus_id: str) -> str | None:
         return os.path.basename(os.readlink(f"/sys/bus/pci/devices/{bus_id}/driver"))
     except OSError:
         return None
+
+
+def _backing_sysfs_paths(name: str, sysfs: str) -> list[str]:
+    """Resolved sysfs path of a block device, plus those of the real disks
+    underneath it when it is stacked (LUKS, LVM, MD), which live under
+    /sys/devices/virtual and would otherwise hide their PCI parent."""
+    base = f"{sysfs}/class/block/{name}"
+    paths = [os.path.realpath(base)]
+    for slave in glob.glob(f"{base}/slaves/*"):
+        paths += _backing_sysfs_paths(os.path.basename(slave), sysfs)
+    return paths
+
+
+def mounted_storage_under(
+    bus_id: str, sysfs: str = "/sys", mounts: str = "/proc/mounts"
+) -> list[str]:
+    """
+    Mounted block devices sitting behind a PCI device.
+
+    Detaching a PCI function tears down everything under it, and Deep rescan
+    removes an entire parent bridge, so an enclosure carrying an NVMe or a
+    USB controller next to the GPU would lose it exactly like yanking the
+    drive mid-write. Some NVIDIA boards expose their own USB-C controller as
+    a sibling function, which puts a stick plugged into the GPU itself in the
+    same blast radius.
+
+    Reads sysfs topology rather than rebuilding it: a block device's real
+    path already contains the BDF of every PCI device above it, so partitions
+    need no special casing.
+
+    ponytail: matches only what /proc/mounts names. Ceiling: a stack it
+    cannot follow reads as "nothing mounted", so this guards the foreseeable
+    case, it does not prove safety. Upgrade path: ask lsblk or udisks for the
+    full holder graph if a real case turns up that this misses.
+    """
+    try:
+        with open(mounts) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    found = []
+    for line in lines:
+        source = line.split(" ", 1)[0]
+        if not source.startswith("/dev/"):
+            continue
+        name = os.path.basename(os.path.realpath(source))
+        if any(f"/{bus_id}/" in p + "/" for p in _backing_sysfs_paths(name, sysfs)):
+            found.append(name)
+    return sorted(set(found))
+
+
+def storage_blocking_removal(bus_ids: list[str]) -> str | None:
+    """Message naming what still has to be unmounted before these PCI
+    devices can be detached, or None when detaching them is safe."""
+    for bdf in bus_ids:
+        mounted = mounted_storage_under(bdf)
+        if mounted:
+            return (
+                f"{bdf} still has mounted storage behind it ({', '.join(mounted)}). "
+                "Unmount it before ejecting the eGPU."
+            )
+    return None
 
 
 PCIE_GT_TO_GEN = {
@@ -229,11 +285,15 @@ async def get_thunderbolt_info() -> dict | None:
     """
     Best-effort Thunderbolt tunnel info via `boltctl list`: takes the first
     peripheral's name/generation/rx/tx speed fields, whichever appear first
-    in the output. Not rigorously matched to the exact eGPU bus ID (boltctl
-    doesn't expose PCI addresses), fine for a single-eGPU setup. Returns None
-    when boltctl isn't installed (e.g. OCuLink, no Thunderbolt subsystem) or
-    reports nothing, so the caller can omit this section entirely rather
-    than showing an error.
+    in the output. Returns None when boltctl isn't installed (e.g. OCuLink,
+    no Thunderbolt subsystem) or reports nothing, so the caller can omit this
+    section entirely rather than showing an error.
+
+    ponytail: takes the first peripheral rather than matching the eGPU,
+    because boltctl exposes no PCI address to match on. Ceiling: with a
+    second Thunderbolt peripheral attached it can describe the wrong one.
+    Upgrade path: correlate through /sys/bus/thunderbolt/devices/*/ and the
+    PCI parent chain if anyone reports a mismatch.
     """
     try:
         proc = await asyncio.to_thread(
@@ -260,6 +320,100 @@ async def get_thunderbolt_info() -> dict | None:
     if not name and not generation:
         return None
     return {"name": name, "generation": generation, "rx_speed": rx_speed, "tx_speed": tx_speed}
+
+
+def devices_needing_authorization(boltctl_list: str) -> list[tuple[str, bool]]:
+    """
+    (uuid, is_stored) for every Thunderbolt device that is present but not
+    authorized, parsed from `boltctl list`.
+
+    boltctl prints an indented tree, so every field arrives prefixed with
+    box-drawing characters ("   |- uuid:  <uuid>") and can only be matched
+    unanchored, the same reason get_thunderbolt_info() uses re.search.
+    Blocks are delimited by slicing between consecutive uuid fields rather
+    than by the bullet glyph, which varies between bolt versions and
+    connection states; field order inside a block is fixed, uuid first.
+
+    Status values: "authorized" means the tunnel is already up,
+    "disconnected" means nothing is plugged in, and only "connected" means
+    present-but-unauthorized, the state worth repairing. There is no
+    "authorized: yes/no" field; the `authorized:` line holds a timestamp.
+    """
+    devices = []
+    uuids = list(re.finditer(r"uuid:\s*(\S+)", boltctl_list))
+    for i, m in enumerate(uuids):
+        end = uuids[i + 1].start() if i + 1 < len(uuids) else len(boltctl_list)
+        block = boltctl_list[m.end() : end]
+        status = re.search(r"status:\s*(\S+)", block)
+        if not status or status.group(1) != "connected":
+            continue
+        stored = re.search(r"stored:\s*(\S+)", block)
+        devices.append((m.group(1), bool(stored) and stored.group(1) != "no"))
+    return devices
+
+
+async def reauthorize_thunderbolt_tunnel() -> None:
+    """
+    Best-effort reauthorization of a Thunderbolt/USB4 tunnel before a PCI
+    rescan, for the reported case where an eject (PCI remove) leaves the eGPU
+    unfindable by a later rescan while a physical replug does bring it back
+    (ROG Ally X + USB4). Hypothesis: the controller drops authorization on
+    the teardown and a plain rescan cannot find what the tunnel no longer
+    carries. Not yet confirmed on hardware; the logs this emits are meant to
+    settle it either way.
+
+    Only reauthorizes devices bolt already has **stored**, i.e. ones the user
+    approved at some earlier point. Auto-approving an unknown device would
+    hand DMA access to whatever happens to be plugged in, which is exactly
+    what bolt's approval prompt exists to prevent; an unstored device is
+    logged and left alone instead.
+
+    Silently skips when boltctl is absent (OCuLink, no Thunderbolt subsystem)
+    or boltd is not running. Never raises into the caller.
+    """
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            ["boltctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=clean_subprocess_env(),
+        )
+    except FileNotFoundError:
+        decky.logger.info("Tunnel reauth: boltctl not installed, skipping")
+        return
+    except Exception as e:
+        decky.logger.info(f"Tunnel reauth: boltctl list failed ({type(e).__name__}), skipping")
+        return
+    if proc.returncode != 0 or not proc.stdout.strip():
+        decky.logger.info("Tunnel reauth: no usable boltctl output, skipping")
+        return
+
+    for uuid, stored in devices_needing_authorization(proc.stdout):
+        if not stored:
+            decky.logger.info(
+                f"Tunnel reauth: {uuid} is unauthorized but not stored in bolt; not "
+                "auto-approving an unknown device. Approve it once from the desktop's "
+                "Thunderbolt settings if it is your eGPU."
+            )
+            continue
+        decky.logger.info(f"Tunnel reauth: authorizing stored device {uuid}")
+        try:
+            auth = await asyncio.to_thread(
+                subprocess.run,
+                ["boltctl", "authorize", uuid],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=clean_subprocess_env(),
+            )
+            decky.logger.info(
+                f"Tunnel reauth: authorize {uuid} rc={auth.returncode} "
+                f"stderr={(auth.stderr or '').strip()!r}"
+            )
+        except Exception as e:
+            decky.logger.warning(f"Tunnel reauth: authorize {uuid} failed: {type(e).__name__}: {e}")
 
 
 async def modprobe_remove(module: str, retries: int = 3, retry_delay: float = 1.0) -> tuple[bool, str]:
@@ -294,6 +448,16 @@ async def modprobe_remove(module: str, retries: int = 3, retry_delay: float = 1.
         if attempt < retries - 1:
             await asyncio.sleep(retry_delay)
     return False, last_err
+
+
+def _read_sysfs(path: str) -> str | None:
+    """Stripped contents of a sysfs attribute, or None when it is gone
+    (hot-unplug races make every read here optional by nature)."""
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
 
 
 def write_sysfs(path: str, value: str) -> tuple[bool, str]:
@@ -333,9 +497,35 @@ async def rebind_egpu_audio(slot: str) -> None:
             f"Audio rebind: video function {video_fn} has no driver/DRM node yet, skipping"
         )
         return
-    # HDMI link training and the compositor grabbing the new output take a
-    # moment after the DRM node appears; rebinding before that was the
-    # too-early failure mode seen on hardware.
+    # A DRM node exists well before a display is actually driving: wait for
+    # a connector to report "connected", which is the kernel's own view of
+    # HPD and link training, instead of trusting a bare sleep to have been
+    # long enough. If no connector ever comes up there is no HDMI audio
+    # endpoint to repair, so skip rather than rebind blindly.
+    for _ in range(15):
+        if any(
+            _read_sysfs(status) == "connected"
+            for status in glob.glob(
+                f"/sys/bus/pci/devices/{video_fn}/drm/card*/card*-*/status"
+            )
+        ):
+            break
+        await asyncio.sleep(1)
+    else:
+        decky.logger.info(
+            f"Audio rebind: no connected display on {video_fn}, nothing to repair"
+        )
+        return
+    # Settle after the connector is up: the codec still needs a moment to
+    # take the ELD. Kept at the value validated on hardware, so the rebind
+    # can only ever land later than the timing that was confirmed working,
+    # never earlier (rebinding too early is the known failure mode).
+    #
+    # ponytail: a calibration constant, not a derived one. Ceiling: a slower
+    # display could still need more than 5s and would silently keep dead
+    # audio. Upgrade path: poll the codec's own eld_valid under
+    # /proc/asound/card*/eld* instead of sleeping, once there is hardware to
+    # calibrate that against.
     await asyncio.sleep(5)
     if get_pci_driver(audio_fn) != "snd_hda_intel":
         decky.logger.info(f"Audio rebind: {audio_fn} not bound to snd_hda_intel, skipping")
@@ -416,6 +606,12 @@ async def unload_and_remove_pci(
     Returns (error_or_None, bus_ids_successfully_removed).
     """
     removed: list[str] = []
+    # Last line of defense: both callers check this before stopping the
+    # display manager, but the removal happens here, so the guard belongs
+    # here too.
+    blocked = storage_blocking_removal(functions)
+    if blocked:
+        return blocked, removed
     if "nvidia" in drivers.values():
         for module in NVIDIA_MODULES:
             ok, err = await modprobe_remove(module)
@@ -464,6 +660,24 @@ class Plugin:
         decky.logger.info("eGPU Switch plugin started")
 
     async def _unload(self):
+        """
+        Decky reloads plugins on its own (auto-update checks, the Developer
+        tab, an update to this plugin), and a reload landing mid-operation is
+        the one scenario that can leave the session stopped: the display
+        manager is down and the code that would bring it back is being torn
+        down with us. Nothing here can finish the interrupted operation, but
+        starting the display manager is idempotent and cheap, so do that as a
+        last act rather than leaving a black screen. Only reached on a
+        graceful unload; a SIGKILL after the grace period still cannot be
+        handled, which is why long fused operations stay opt-in (see README).
+        """
+        if self._operation_lock.locked():
+            decky.logger.warning(
+                "Unloading while an operation is still running; starting the display "
+                "manager so the session cannot be left down."
+            )
+            result = await self._start_display_manager_impl()
+            decky.logger.info(f"Display manager start on unload: {result}")
         decky.logger.info("eGPU Switch plugin unloaded")
 
     # ---- read-only status ----
@@ -603,6 +817,7 @@ class Plugin:
         a plugin upgrade, or a previous eject attempt that failed).
         """
         if self._operation_lock.locked():
+            decky.logger.warning("eject_egpu rejected: an operation is already in progress")
             return {"ok": False, "error": "An eGPU Switch operation is already in progress."}
         async with self._operation_lock:
             binary = find_egpu_binary()
@@ -632,11 +847,19 @@ class Plugin:
                 return {"ok": False, "error": "Could not determine the eGPU's PCI bus ID."}
 
             slot = bus_id.rsplit(".", 1)[0]
-            functions = await list_pci_functions(slot)
+            functions = list_pci_functions(slot)
             if not functions:
                 functions = [bus_id]
             drivers = {f: get_pci_driver(f) for f in functions}
             decky.logger.info(f"Ejecting eGPU: slot={slot} functions={functions} drivers={drivers}")
+
+            # Pre-flight before tearing the session down: reaching the check
+            # inside unload_and_remove_pci would mean the display manager was
+            # already stopped, so the user would lose their session just to be
+            # told the eject is refused.
+            blocked = storage_blocking_removal(functions)
+            if blocked:
+                return {"ok": False, "error": blocked}
 
             stop_result = await self._stop_display_manager_impl()
             if not stop_result.get("ok"):
@@ -700,22 +923,42 @@ class Plugin:
         rescan can never fix since it only adds devices into an
         already-fixed window. Off by default since removing the bridge
         briefly affects anything else sharing that same physical port.
+
+        Takes the operation lock like every other mutating RPC. This used to
+        be a single non-destructive sysfs write and ran lock-free, but it can
+        now remove a PCI bridge, reauthorize a tunnel and rebind drivers,
+        which must never interleave with an in-flight eject or switch: the
+        frontend's `busy` flag is per-component state and resets when the
+        QAM panel is closed and reopened mid-operation, so it cannot be the
+        only thing serializing this.
         """
-        ok, err = await self._rescan_pci_impl()
-        if not ok:
-            return {"ok": False, "error": err}
-        return {"ok": True}
+        if self._operation_lock.locked():
+            decky.logger.warning("rescan_pci rejected: an operation is already in progress")
+            return {"ok": False, "error": "An eGPU Switch operation is already in progress."}
+        async with self._operation_lock:
+            ok, err, slot_to_rebind = await self._rescan_pci_impl()
+            if not ok:
+                return {"ok": False, "error": err}
+            # Standalone rescan: no display manager restart follows, so the
+            # video pipeline is as up as it will get; rebind now.
+            if slot_to_rebind:
+                await rebind_egpu_audio(slot_to_rebind)
+            return {"ok": True}
 
     async def restart_display_manager(self) -> dict:
         """Standalone recovery action, RPC-exposed directly."""
         if self._operation_lock.locked():
+            decky.logger.warning(
+                "restart_display_manager rejected: an operation is already in progress"
+            )
             return {"ok": False, "error": "An eGPU Switch operation is already in progress."}
         async with self._operation_lock:
             return await self._restart_display_manager_impl()
 
     # ---- internals ----
 
-    async def _rescan_pci_impl(self) -> tuple[bool, str]:
+    async def _rescan_pci_impl(self) -> tuple[bool, str, str | None]:
+        """Returns (ok, error, slot_needing_audio_rebind)."""
         settings = load_settings()
         binary = find_egpu_binary()
         bus_id = None
@@ -763,6 +1006,18 @@ class Plugin:
                     )
                 else:
                     bridge = find_parent_bridge(bus_id)
+                    # Removing the bridge takes down everything behind it,
+                    # not just the eGPU, so refuse while a filesystem from
+                    # that subtree is mounted (enclosures that also carry an
+                    # NVMe or a USB storage controller). Plain rescan still
+                    # runs below; it never removes anything.
+                    mounted = mounted_storage_under(bridge) if bridge else []
+                    if mounted:
+                        decky.logger.warning(
+                            f"Deep rescan: {bridge} has mounted storage behind it "
+                            f"({', '.join(mounted)}), skipping bridge removal"
+                        )
+                        bridge = None
                     if bridge:
                         try:
                             ok, err = await asyncio.wait_for(
@@ -780,21 +1035,30 @@ class Plugin:
                                 f"Deep rescan: removing PCI bridge {bridge} stalled (something "
                                 "may still be using a device behind it). Not rescanning; a "
                                 "reboot may be needed."
-                            )
+                            ), None
             elif bus_id:
                 decky.logger.info(
                     "Deep rescan: eGPU connected and functional, skipping bridge removal"
                 )
+        # Only in the recovery path (eGPU missing): a tester on USB4 reports
+        # that after an eject a rescan never finds the card again while a
+        # physical replug does, which fits the controller having dropped the
+        # tunnel's authorization on teardown. Harmless no-op when the tunnel
+        # is fine, when the device was never approved, or when boltctl isn't
+        # installed, and it costs nothing on a healthy rescan because it is
+        # gated on the same condition as everything else here.
+        if bus_id and not egpu_connected:
+            await reauthorize_thunderbolt_tunnel()
         ok, err = write_sysfs("/sys/bus/pci/rescan", "1")
         # If this rescan is (re-)adding the eGPU (it was absent or broken
         # before), its HDMI audio function will re-probe as "not
-        # operational"; rebind it once it enumerates. Runs regardless of
-        # the deep_rescan setting: the audio bug follows any re-add, not
-        # just bridge recovery. Skipped when the eGPU was already healthy,
-        # so a no-op rescan never disturbs working audio.
-        if ok and bus_id and not egpu_connected:
-            await rebind_egpu_audio(bus_id.rsplit(".", 1)[0].lower())
-        return ok, err
+        # operational" and needs a rebind. Report the slot instead of doing
+        # it here: the right moment depends on the caller (a switch restarts
+        # the display manager afterwards, and the rebind has to come after
+        # that). Stays None when the eGPU was already healthy, so a no-op
+        # rescan never disturbs working audio.
+        slot_to_rebind = bus_id.rsplit(".", 1)[0].lower() if (ok and bus_id and not egpu_connected) else None
+        return ok, err, slot_to_rebind
 
     async def _systemctl(self, action: str, *units: str, timeout: int = 60) -> dict:
         cmd = ["/usr/bin/systemctl", action, *units]
@@ -835,11 +1099,15 @@ class Plugin:
 
     async def _set_boot_vga(self, mode: str) -> dict:
         if self._operation_lock.locked():
+            decky.logger.warning(
+                f"set_boot_vga({mode!r}) rejected: an operation is already in progress"
+            )
             return {"ok": False, "error": "An eGPU Switch operation is already in progress."}
         async with self._operation_lock:
             binary = find_egpu_binary()
             if not binary:
                 return {"ok": False, "error": "all-ways-egpu binary not found on this system."}
+            slot_to_rebind = None
             if mode == "egpu":
                 # After an eject, the eGPU is genuinely gone from lspci (removed from
                 # the PCI bus), not just slow to enumerate - all-ways-egpu's own
@@ -851,7 +1119,7 @@ class Plugin:
                 # (Advanced setting) also applies here, not just the standalone
                 # button - this is the exact "won't reconnect after eject" case it
                 # was added for.
-                ok, err = await self._rescan_pci_impl()
+                ok, err, slot_to_rebind = await self._rescan_pci_impl()
                 decky.logger.info(f"Pre-enable rescan: ok={ok} err={err!r}")
             try:
                 proc = await asyncio.to_thread(
@@ -887,6 +1155,14 @@ class Plugin:
                     "cli_output": combined.strip(),
                     "restart": restart_result,
                 }
+            # Audio rebind goes after the display manager restart, not
+            # before: the restart re-initializes the GPU's display pipeline
+            # and would undo a rebind done earlier, and what hardware did
+            # confirm (see rebind_egpu_audio) is that the codec only comes
+            # back when the video side is already up. Untested ordering by
+            # itself, unlike the standalone rescan path.
+            if slot_to_rebind:
+                await rebind_egpu_audio(slot_to_rebind)
             return {"ok": True, "cli_output": combined.strip(), "restart": restart_result}
 
     async def _switch_to_igpu_and_eject(self) -> dict:
@@ -898,6 +1174,9 @@ class Plugin:
         to be stopped before touching the nvidia modules.
         """
         if self._operation_lock.locked():
+            decky.logger.warning(
+                "_switch_to_igpu_and_eject rejected: an operation is already in progress"
+            )
             return {"ok": False, "error": "An eGPU Switch operation is already in progress."}
         async with self._operation_lock:
             binary = find_egpu_binary()
@@ -925,10 +1204,16 @@ class Plugin:
             drivers: dict[str, str | None] = {}
             if pre_status["egpu_connected"] and pre_status["bus_id"]:
                 slot = pre_status["bus_id"].rsplit(".", 1)[0]
-                functions = await list_pci_functions(slot)
+                functions = list_pci_functions(slot)
                 if not functions:
                     functions = [pre_status["bus_id"]]
                 drivers = {f: get_pci_driver(f) for f in functions}
+
+            # Same pre-flight as the standalone eject, so both paths refuse
+            # before touching the session instead of one bouncing it first.
+            blocked = storage_blocking_removal(functions)
+            if blocked:
+                return {"ok": False, "error": blocked}
 
             stop_result = await self._stop_display_manager_impl()
             if not stop_result.get("ok"):

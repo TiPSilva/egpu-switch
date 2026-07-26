@@ -21,11 +21,12 @@ import ConfirmActionModal from './ConfirmActionModal';
 const POLL_INTERVAL_MS = 5000;
 
 // Longest legitimate operation is Switch to eGPU with everything slow:
-// pre-rescan status read (15s) + bridge removal (20s) + audio rebind wait
-// (~27s) + set-boot-vga retries (45s) + display manager restart (60s)
-// ≈ 170s. Anything past 240s means the backend RPC wedged (seen on
-// hardware: a sysfs write blocking in kernel); without this, `busy` never
-// clears and every button stays disabled forever.
+// pre-rescan status read (15s) + bridge removal (20s) + tunnel reauth
+// (25s) + set-boot-vga retries (45s) + display manager restart (60s) +
+// audio rebind wait (26s) ≈ 190s. Anything past 240s means the backend
+// RPC wedged (seen on hardware: a sysfs write blocking in kernel);
+// without this, `busy` never clears and every button stays disabled
+// forever.
 const OP_TIMEOUT_MS = 240000;
 
 const withTimeout = (p: Promise<OpResult>): Promise<OpResult> =>
@@ -61,6 +62,10 @@ const Content: FC = () => {
   const [deepRescan, setDeepRescanState] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
+  // Read by the poll timer, which captures its closure once and would
+  // otherwise keep seeing the initial `busy`.
+  const busyRef = useRef(false);
+
   const refresh = useCallback(async () => {
     try {
       setStatus(await getStatus());
@@ -71,7 +76,15 @@ const Content: FC = () => {
 
   useEffect(() => {
     refresh();
-    timerRef.current = window.setInterval(refresh, POLL_INTERVAL_MS);
+    // Skip ticks while an operation is running. Each tick shells out to
+    // `all-ways-egpu status` as root (which itself runs lspci and friends),
+    // and an operation can now take a couple of minutes: polling through it
+    // means dozens of pointless subprocesses racing the very state the
+    // operation is changing, and the answers would be transient states the
+    // user cannot act on anyway. runGuarded refreshes once when it finishes.
+    timerRef.current = window.setInterval(() => {
+      if (!busyRef.current) refresh();
+    }, POLL_INTERVAL_MS);
     return () => {
       if (timerRef.current) window.clearInterval(timerRef.current);
     };
@@ -88,7 +101,8 @@ const Content: FC = () => {
   }, []);
 
   const runGuarded = async (fn: () => Promise<OpResult>) => {
-    if (busy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setLastError(null);
     setLastSuccess(null);
@@ -99,6 +113,7 @@ const Content: FC = () => {
     } catch (e) {
       setLastError(String(e));
     } finally {
+      busyRef.current = false;
       setBusy(false);
       refresh();
     }
