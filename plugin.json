@@ -2,5 +2,10 @@
   "name": "eGPU-Switch",
   "author": "TiPSilva",
   "flags": ["root"],
-  "api_version": 1
+  "api_version": 1,
+  "publish": {
+    "tags": ["egpu", "gpu", "system", "root"],
+    "description": "Switch between an external GPU and the internal one from Game Mode, and eject the eGPU safely before unplugging the cable. Drives all-ways-egpu, which has to be installed and set up beforehand.",
+    "image": "https://opengraph.githubassets.com/1/TiPSilva/egpu-switch"
+  }
 }

@@ -1,6 +1,10 @@
 node_modules/
 dist/
 out/
+# pnpm is the project's package manager and pnpm-lock.yaml is committed: the
+# plugin store's CI builds with `pnpm i --frozen-lockfile` and fails outright
+# without it. npm's lockfile stays ignored so a stray `npm install` cannot
+# commit a second, conflicting one.
 package-lock.json
 *.log
 .DS_Store
