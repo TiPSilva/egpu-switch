@@ -130,9 +130,9 @@ Should return `200`.
 
 Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
 
-- **Thunderbolt cable**: always-visible indicator, a colored dot plus a plain-language
-  label, so you don't have to parse the more detailed Status text just to know if it's
-  safe to disconnect:
+- **eGPU cable**: always-visible indicator, a colored dot plus a plain-language label, so
+  you don't have to parse the more detailed Status text just to know if it's safe to
+  disconnect (works the same whether the connection is Thunderbolt or OCuLink):
   - 🟢 **Safe**: nothing is currently bound to the eGPU (either it was never connected, or
     it was successfully ejected while the cable is still plugged in).
   - 🔴 **Not safe (in use)**: the eGPU is the active display GPU right now.
@@ -178,11 +178,23 @@ Open the quick access menu (QAM) and go to the "eGPU Switch" tab.
   and re-add the eGPU's parent PCI bridge first.
 - **Connection** (collapsed by default): fetched on demand, only when you expand it, since
   it costs a couple of extra subprocess calls not worth paying on every 5s status poll.
-  Shows the negotiated PCIe link speed/width (works for any connection type, including
-  OCuLink, since it's read from the GPU's own PCIe link status via `lspci -vv`, nothing
-  Thunderbolt-specific) plus Thunderbolt generation, tunnel speed and controller name when
-  the connection actually goes through Thunderbolt (via `boltctl list`, best-effort single
-  eGPU; silently omitted when not applicable, e.g. OCuLink or no `boltctl` installed).
+  Always shows **Connection type** (`Thunderbolt` when `boltctl` confirms a tunnel,
+  `PCIe` otherwise; deliberately not a guess at `OCuLink` specifically, since the absence
+  of Thunderbolt info could just as easily mean `boltctl` isn't installed on an actual
+  Thunderbolt system) plus the negotiated PCIe link speed/width (works for any connection
+  type, since it's read from the GPU's own PCIe link status via `lspci -vv`, nothing
+  Thunderbolt-specific). When the connection actually goes through Thunderbolt, also shows
+  tunnel generation/speed and the controller's vendor + name (e.g. "ADTLINK UT3G"), picked
+  from whichever paired Thunderbolt/USB4 device `boltctl list` currently reports as
+  authorized/connected rather than just the first one ever paired (silently omitted when
+  not applicable, e.g. OCuLink or no `boltctl` installed). Also shows the current
+  **Boot/sleep freeze fix** state, read from
+  `/sys/module/thunderbolt/parameters/host_reset` (silently omitted on kernels without
+  this parameter, or when the thunderbolt module isn't loaded): "Not applied (default)" is
+  the state that can hang the whole system on boot with the eGPU already connected, or on
+  wake from sleep with it active, on some AMD platforms; see [Freezing on boot or on
+  sleep/wake](#freezing-on-boot-or-on-sleepwake-with-the-egpu-connected-amd-platforms)
+  below if you see that and are having either problem.
 - **Advanced** (collapsed by default):
   - **Automatic eject (experimental)**: off by default. When enabled, **Switch to iGPU**
     also ejects the eGPU automatically in the same operation, one flicker instead of two

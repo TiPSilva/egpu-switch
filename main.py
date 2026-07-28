@@ -125,11 +125,34 @@ def parse_status(raw: str) -> dict:
     return result
 
 
+def parse_gpu_name(lspci_vmm_output: str) -> str | None:
+    """
+    Extracts the friendly marketing name (e.g. "GeForce RTX 3070") from
+    `lspci -vmm`'s machine-readable "Device:" field (e.g.
+    "GA104 [GeForce RTX 3070]"), rather than regexing the human-readable
+    summary line. Confirmed on hardware that the summary-line regex isn't
+    reliable across lspci versions/locales: it fell through to its raw-line
+    fallback, showing the whole "Vendor Chip [Marketing Name] (rev X)"
+    string instead of just the marketing name. -vmm's one-field-per-line
+    format has no such ambiguity: "Device:" is always exactly the device
+    field, whatever it contains.
+    """
+    device = None
+    for line in lspci_vmm_output.splitlines():
+        if line.startswith("Device:"):
+            device = line.split(":", 1)[1].strip()
+            break
+    if not device:
+        return None
+    m = re.search(r"\[([^\[\]]+)\]\s*$", device)
+    return m.group(1) if m else device
+
+
 async def lookup_gpu_name(bus_id: str) -> str | None:
     try:
         proc = await asyncio.to_thread(
             subprocess.run,
-            ["lspci", "-D", "-s", bus_id],
+            ["lspci", "-D", "-s", bus_id, "-vmm"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -139,12 +162,7 @@ async def lookup_gpu_name(bus_id: str) -> str | None:
         return None
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
-    line = proc.stdout.strip().splitlines()[0]
-    m = re.search(r"\[([^\[\]]+)\]\s*(?:\(rev [^)]+\))?\s*$", line)
-    if m:
-        return m.group(1)
-    parts = line.split(": ", 1)
-    return parts[1].strip() if len(parts) == 2 else line
+    return parse_gpu_name(proc.stdout)
 
 
 def resolve_host_uid() -> int:
@@ -208,10 +226,10 @@ def mounted_storage_under(
     path already contains the BDF of every PCI device above it, so partitions
     need no special casing.
 
-    ponytail: matches only what /proc/mounts names. Ceiling: a stack it
-    cannot follow reads as "nothing mounted", so this guards the foreseeable
-    case, it does not prove safety. Upgrade path: ask lsblk or udisks for the
-    full holder graph if a real case turns up that this misses.
+    Limitation: matches only what /proc/mounts names. A stack it cannot
+    follow reads as "nothing mounted", so this guards the foreseeable case,
+    it does not prove safety. If a real case turns up that this misses,
+    asking lsblk or udisks for the full holder graph would close the gap.
     """
     try:
         with open(mounts) as f:
@@ -281,19 +299,63 @@ async def get_pcie_link_info(bus_id: str) -> dict | None:
     return {"speed": speed, "generation": PCIE_GT_TO_GEN.get(speed), "width": m.group(2)}
 
 
+def parse_thunderbolt_info(boltctl_list_output: str) -> dict | None:
+    """
+    Picks the currently authorized (connected) Thunderbolt/USB4 peripheral
+    from `boltctl list` output and returns its vendor+name, generation and
+    tunnel speeds - not just the first peripheral in the list, which used
+    to grab the wrong device's fields whenever more than one had ever been
+    paired. Confirmed on hardware: a previously-connected, now-disconnected
+    dock's cryptic name ("246x") was picked over the actually-connected
+    eGPU's own name ("UT3G"), because the old parser searched the whole
+    boltctl output for the first "name:" line, regardless of which device
+    block it belonged to or whether that device was even present.
+
+    Peripherals are blank-line-separated blocks in boltctl's output; the
+    right one is whichever has status "authorized" (bolt's word for
+    "currently connected and trusted"), not "disconnected". Falls back to
+    the first peripheral block if none show authorized, rather than
+    returning nothing.
+
+    The device title line (e.g. " * ADTLINK UT3G") already reads as
+    "<vendor> <name>", but is not used directly: it's prefixed with a
+    bullet glyph that varies between bolt versions and terminal encodings,
+    so vendor and name are read from their own stable fields and joined
+    the same way instead.
+    """
+    blocks = [b for b in boltctl_list_output.split("\n\n") if b.strip()]
+
+    def field(block: str, pattern: str) -> str | None:
+        m = re.search(pattern, block)
+        return m.group(1).strip() if m else None
+
+    peripherals = [b for b in blocks if field(b, r"type:\s*(\S+)") == "peripheral"]
+    if not peripherals:
+        return None
+    chosen = next(
+        (b for b in peripherals if field(b, r"status:\s*(\S+)") == "authorized"),
+        peripherals[0],
+    )
+
+    vendor = field(chosen, r"vendor:\s*(.+)")
+    dev_name = field(chosen, r"name:\s*(.+)")
+    generation = field(chosen, r"generation:\s*(.+)")
+    rx_speed = field(chosen, r"rx speed:\s*([^\n]+)")
+    tx_speed = field(chosen, r"tx speed:\s*([^\n]+)")
+
+    name = f"{vendor} {dev_name}".strip() if vendor and dev_name else (dev_name or vendor)
+    if not name and not generation:
+        return None
+    return {"name": name, "generation": generation, "rx_speed": rx_speed, "tx_speed": tx_speed}
+
+
 async def get_thunderbolt_info() -> dict | None:
     """
-    Best-effort Thunderbolt tunnel info via `boltctl list`: takes the first
-    peripheral's name/generation/rx/tx speed fields, whichever appear first
-    in the output. Returns None when boltctl isn't installed (e.g. OCuLink,
-    no Thunderbolt subsystem) or reports nothing, so the caller can omit this
-    section entirely rather than showing an error.
-
-    ponytail: takes the first peripheral rather than matching the eGPU,
-    because boltctl exposes no PCI address to match on. Ceiling: with a
-    second Thunderbolt peripheral attached it can describe the wrong one.
-    Upgrade path: correlate through /sys/bus/thunderbolt/devices/*/ and the
-    PCI parent chain if anyone reports a mismatch.
+    Thunderbolt/USB4 tunnel info for the currently connected peripheral via
+    `boltctl list`. Returns None when boltctl isn't installed (e.g.
+    OCuLink, no Thunderbolt subsystem) or reports nothing, so the caller
+    can omit this section entirely rather than showing an error. See
+    parse_thunderbolt_info() for how the right peripheral is chosen.
     """
     try:
         proc = await asyncio.to_thread(
@@ -308,18 +370,7 @@ async def get_thunderbolt_info() -> dict | None:
         return None
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
-
-    def field(pattern: str) -> str | None:
-        m = re.search(pattern, proc.stdout)
-        return m.group(1).strip() if m else None
-
-    name = field(r"name:\s*(.+)")
-    generation = field(r"generation:\s*(.+)")
-    rx_speed = field(r"rx speed:\s*([^\n]+)")
-    tx_speed = field(r"tx speed:\s*([^\n]+)")
-    if not name and not generation:
-        return None
-    return {"name": name, "generation": generation, "rx_speed": rx_speed, "tx_speed": tx_speed}
+    return parse_thunderbolt_info(proc.stdout)
 
 
 def devices_needing_authorization(boltctl_list: str) -> list[tuple[str, bool]]:
@@ -350,6 +401,28 @@ def devices_needing_authorization(boltctl_list: str) -> list[tuple[str, bool]]:
         stored = re.search(r"stored:\s*(\S+)", block)
         devices.append((m.group(1), bool(stored) and stored.group(1) != "no"))
     return devices
+
+
+def thunderbolt_host_reset_status(sysfs: str = "/sys") -> str | None:
+    """
+    Whether the `thunderbolt.host_reset` kernel module parameter is enabled
+    (the default) or disabled on this boot, read from
+    /sys/module/thunderbolt/parameters/host_reset - the standard sysfs
+    location the kernel exposes for any module_param(), boolean ones
+    displayed as a bare "Y" or "N" regardless of how they were set on the
+    cmdline (e.g. thunderbolt.host_reset=0 still reads back as "N").
+
+    Confirmed on hardware to matter: leaving it enabled (the default) can
+    hang the whole system on boot with an eGPU already connected, or on
+    resume from sleep with it active; disabling it fixed both. Returns None
+    when the file doesn't exist (older kernel without this parameter, or the
+    thunderbolt module isn't loaded at all, e.g. OCuLink-only systems), so
+    the caller can omit this row entirely rather than showing a false "N/A".
+    """
+    content = _read_sysfs(f"{sysfs}/module/thunderbolt/parameters/host_reset")
+    if content is None:
+        return None
+    return "disabled" if content.upper() == "N" else "enabled"
 
 
 async def reauthorize_thunderbolt_tunnel() -> None:
@@ -802,6 +875,11 @@ class Plugin:
         thunderbolt = await get_thunderbolt_info()
 
         return {
+            # "Thunderbolt" only when boltctl actually confirms a tunnel;
+            # otherwise "PCIe" rather than guessing "OCuLink" specifically,
+            # since the absence of Thunderbolt info could just as easily
+            # mean boltctl isn't installed on an actual Thunderbolt system.
+            "connection_type": "Thunderbolt" if thunderbolt else "PCIe",
             "pcie_generation": pcie.get("generation") if pcie else None,
             "pcie_speed": pcie.get("speed") if pcie else None,
             "pcie_width": pcie.get("width") if pcie else None,
@@ -809,6 +887,7 @@ class Plugin:
             "thunderbolt_rx_speed": thunderbolt.get("rx_speed") if thunderbolt else None,
             "thunderbolt_tx_speed": thunderbolt.get("tx_speed") if thunderbolt else None,
             "thunderbolt_name": thunderbolt.get("name") if thunderbolt else None,
+            "thunderbolt_host_reset": thunderbolt_host_reset_status(),
         }
 
     # ---- settings ----

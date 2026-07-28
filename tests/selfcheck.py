@@ -18,6 +18,19 @@ Covers four pure functions:
                                that was already fine
   parse_status                 every other decision reads from it
 
+Also covers two lower-stakes but still worth-getting-right parsers:
+
+  thunderbolt_host_reset_status drives the UI hint pointing at a real fix for
+                               system hangs (see README), so a flipped Y/N
+                               reading would tell a user their fix didn't
+                               apply when it did, or vice versa
+  parse_thunderbolt_info        picks which paired Thunderbolt/USB4 device's
+                               name is shown in the Connection panel; with
+                               more than one ever paired, picking the wrong
+                               one shows the user someone else's device name
+                               instead of their eGPU's (confirmed on tester
+                               hardware)
+
 Everything else in main.py talks to real hardware and is validated on the
 device instead.
 """
@@ -38,6 +51,8 @@ from main import (  # noqa: E402
     devices_needing_authorization,
     mounted_storage_under,
     parse_status,
+    parse_thunderbolt_info,
+    thunderbolt_host_reset_status,
 )
 
 failures = []
@@ -167,6 +182,99 @@ check(
     "storage: unreadable mounts file fails closed to empty, never crashes",
     mounted_storage_under("0000:65:00.0", root, "/nonexistent"),
     [],
+)
+
+# --- parse_thunderbolt_info -------------------------------------------------
+# Real `boltctl list` output captured on tester hardware (ROG Ally X, two
+# peripherals ever paired): a disconnected USB4 dock listed first, and the
+# actually-connected eGPU enclosure second. This is the exact case that broke
+# the old "first name: field found" parser.
+BOLTCTL_TWO_PERIPHERALS = """ o ASMedia 246x
+   |- type:          peripheral
+   |- name:          246x
+   |- vendor:        ASMedia
+   |- uuid:          0e3a4c17-c007-c06b-ffff-ffffffffffff
+   |- generation:    USB4
+   |- status:        disconnected
+   |- authorized:    sex 18 abr 2025 15:37:13
+   |- connected:     sex 18 abr 2025 15:37:11
+   `- stored:        sex 18 abr 2025 15:37:13
+      |- policy:     iommu
+      `- key:        no
+
+ * ADTLINK UT3G
+   |- type:          peripheral
+   |- name:          UT3G
+   |- vendor:        ADTLINK
+   |- uuid:          1c4b4c17-8028-1d48-ffff-ffffffffffff
+   |- generation:    USB4
+   |- status:        authorized
+   |  |- domain:     77393804-d1bb-8ef9-ffff-ffffffffffff
+   |  |- rx speed:   40 Gb/s = 2 lanes * 20 Gb/s
+   |  |- tx speed:   40 Gb/s = 2 lanes * 20 Gb/s
+   |  `- authflags:  none
+   |- authorized:    ter 28 jul 2026 15:47:50
+   |- connected:     ter 28 jul 2026 15:47:48
+   `- stored:        ter 25 fev 2025 01:15:52
+      |- policy:     iommu
+      `- key:        no
+"""
+tb_info = parse_thunderbolt_info(BOLTCTL_TWO_PERIPHERALS)
+check(
+    "thunderbolt: picks the authorized peripheral's name, not the first one listed",
+    tb_info["name"] if tb_info else None,
+    "ADTLINK UT3G",
+)
+check(
+    "thunderbolt: tunnel speed comes from the same (authorized) block",
+    tb_info["rx_speed"] if tb_info else None,
+    "40 Gb/s = 2 lanes * 20 Gb/s",
+)
+check(
+    "thunderbolt: no authorized peripheral at all falls back to the first one",
+    parse_thunderbolt_info(
+        BOLTCTL_TWO_PERIPHERALS.replace("status:        authorized", "status:        disconnected")
+    )["name"],
+    "ASMedia 246x",
+)
+check(
+    "thunderbolt: empty output -> None",
+    parse_thunderbolt_info(""),
+    None,
+)
+
+# --- thunderbolt_host_reset_status -----------------------------------------
+tb_root = tempfile.mkdtemp()
+os.makedirs(f"{tb_root}/module/thunderbolt/parameters")
+
+
+def write_host_reset(value):
+    with open(f"{tb_root}/module/thunderbolt/parameters/host_reset", "w") as f:
+        f.write(value)
+
+
+write_host_reset("Y")
+check(
+    "host_reset: kernel's 'Y' display reads as enabled (the default)",
+    thunderbolt_host_reset_status(tb_root),
+    "enabled",
+)
+write_host_reset("N")
+check(
+    "host_reset: kernel's 'N' display reads as disabled (the fix applied)",
+    thunderbolt_host_reset_status(tb_root),
+    "disabled",
+)
+write_host_reset("n")
+check(
+    "host_reset: lowercase is still read correctly",
+    thunderbolt_host_reset_status(tb_root),
+    "disabled",
+)
+check(
+    "host_reset: no such file (older kernel, or thunderbolt module not loaded) -> None",
+    thunderbolt_host_reset_status(tempfile.mkdtemp()),
+    None,
 )
 
 # --- audio_eld_healthy -----------------------------------------------------

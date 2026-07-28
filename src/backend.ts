@@ -21,6 +21,7 @@ export interface OpResult {
 }
 
 export interface ConnectionInfo {
+  connection_type: 'Thunderbolt' | 'PCIe';
   pcie_generation: string | null;
   pcie_speed: string | null;
   pcie_width: string | null;
@@ -28,6 +29,7 @@ export interface ConnectionInfo {
   thunderbolt_rx_speed: string | null;
   thunderbolt_tx_speed: string | null;
   thunderbolt_name: string | null;
+  thunderbolt_host_reset: 'enabled' | 'disabled' | null;
 }
 
 export interface Settings {

@@ -168,7 +168,7 @@ const Content: FC = () => {
     if (!status) return 'Loading…';
     if (!status.installed) return 'all-ways-egpu is not installed on this system.';
     if (!status.setup_done) return "Not configured. Run 'all-ways-egpu setup' once from a terminal.";
-    if (!status.egpu_connected) return 'eGPU configured but not detected (check Thunderbolt cable).';
+    if (!status.egpu_connected) return 'eGPU configured but not detected (check the eGPU cable).';
     return status.egpu_active
       ? `eGPU active (${status.gpu_name ?? status.bus_id})`
       : `eGPU connected, iGPU active (${status.gpu_name ?? status.bus_id})`;
@@ -235,9 +235,9 @@ const Content: FC = () => {
   };
 
   return (
-    <PanelSection title="eGPU Switch">
+    <PanelSection>
       <PanelSectionRow>
-        <Field label="Thunderbolt cable" focusable>
+        <Field label="eGPU cable" focusable>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <span
@@ -309,6 +309,11 @@ const Content: FC = () => {
       {connectionOpen && !connectionLoading && connectionInfo && (
         <>
           <PanelSectionRow>
+            <Field label="Connection type" focusable>
+              {connectionInfo.connection_type}
+            </Field>
+          </PanelSectionRow>
+          <PanelSectionRow>
             <Field label="PCIe link" focusable>
               {connectionInfo.pcie_generation && connectionInfo.pcie_width
                 ? `${connectionInfo.pcie_generation} ${connectionInfo.pcie_width} (${connectionInfo.pcie_speed})`
@@ -327,6 +332,27 @@ const Content: FC = () => {
             <PanelSectionRow>
               <Field label="Controller" focusable>
                 {connectionInfo.thunderbolt_name}
+              </Field>
+            </PanelSectionRow>
+          )}
+          {connectionInfo.thunderbolt_host_reset && (
+            <PanelSectionRow>
+              <Field label="Boot/sleep freeze fix" focusable>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                  <span
+                    style={{
+                      color:
+                        connectionInfo.thunderbolt_host_reset === 'disabled' ? '#4ade80' : '#fbbf24',
+                    }}
+                  >
+                    {connectionInfo.thunderbolt_host_reset === 'disabled'
+                      ? 'Applied'
+                      : 'Not applied (default)'}
+                  </span>
+                  <span style={{ fontSize: '12px', opacity: 0.7 }}>
+                    thunderbolt.host_reset: {connectionInfo.thunderbolt_host_reset}
+                  </span>
+                </div>
               </Field>
             </PanelSectionRow>
           )}
