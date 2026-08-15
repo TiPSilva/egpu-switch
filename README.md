@@ -322,6 +322,14 @@ Only confirmed on an AMD Ryzen 7840U (Phoenix) system so far; if it doesn't help
 hardware, powering on without the eGPU and connecting after boot (regular hotplug) remains
 a reliable fallback.
 
+## Extras
+
+[`extras/shutdown-eject`](extras/shutdown-eject) is a standalone systemd unit, independent
+of this Decky plugin, that fixes shutdown/reboot hanging at the boot splash when an eGPU is
+still connected. `all-ways-egpu`'s own shutdown hook only flips boot VGA, it never detaches
+the eGPU from the PCI bus, which can hang the same way as unplugging the cable without
+ejecting first. Install it once with `sudo ./install.sh`; see its own README for details.
+
 ## Testing safely
 
 Keep an SSH session open to the device while testing. If the gamescope session doesn't

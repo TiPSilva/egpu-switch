@@ -1,0 +1,13 @@
+[Unit]
+Description=Safely eject the eGPU (unload nvidia modules, detach from PCI bus) before shutdown/reboot
+Documentation=https://github.com/TiPSilva/egpu-switch
+DefaultDependencies=no
+Before=halt.target shutdown.target reboot.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30
+ExecStart=/usr/local/bin/egpu-shutdown-eject.sh
+
+[Install]
+WantedBy=halt.target shutdown.target reboot.target
