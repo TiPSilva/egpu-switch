@@ -9,6 +9,8 @@ import json
 import os
 import pwd
 import re
+import secrets
+import stat
 import subprocess
 
 import decky
@@ -69,19 +71,70 @@ def clean_subprocess_env() -> dict:
     return env
 
 
+INSTALL_SYSTEM_WIDE = "sudo install -o root -g root -m 755 ~/bin/all-ways-egpu /usr/local/bin/"
+UNTRUSTED_MESSAGE = (
+    "all-ways-egpu is in your home folder, where programs running as your user can modify it. "
+    "This plugin runs commands as root and can no longer use that copy. In Desktop Mode, install "
+    f"it in a system directory with: {INSTALL_SYSTEM_WIDE} "
+    "Or move to Yby eGPU (github.com/TiPSilva/yby-egpu), which does not need all-ways-egpu."
+)
+NOT_FOUND_MESSAGE = "all-ways-egpu binary not found on this system."
+
+
+def trusted_executable(path: str, owner_uid: int = 0) -> bool:
+    """
+    Whether root may run this file: it resolves (links followed) to a
+    regular executable, and the file and every directory above it belong to
+    root and cannot be written by group or others. Anything a user could
+    swap would hand that user root, since this plugin runs as root.
+    owner_uid only exists so tests can use a tree they own.
+    """
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or not os.access(real, os.X_OK):
+        return False
+    p = real
+    while True:
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return False
+        if st.st_uid not in (0, owner_uid) or st.st_mode & 0o022:
+            return False
+        parent = os.path.dirname(p)
+        if parent == p:
+            return True
+        p = parent
+
+
 def find_egpu_binary() -> str | None:
+    """
+    all-ways-egpu from a system directory only. On immutable systems its
+    installer puts it in ~/bin, which any program running as the user can
+    replace: running that as root was a privilege escalation, so that copy
+    is no longer used (see UNTRUSTED_MESSAGE).
+    """
     for p in CANDIDATE_PATHS:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
+        if trusted_executable(p):
             return p
+    return None
+
+
+def user_copy_of_egpu_binary() -> str | None:
+    """The all-ways-egpu in the user's ~/bin, only to say why it is not used."""
     home = os.environ.get("DECKY_USER_HOME")
     if home:
         candidate = os.path.join(home, "bin", "all-ways-egpu")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    for candidate in glob.glob("/home/*/bin/all-ways-egpu"):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        if os.path.isfile(candidate):
             return candidate
     return None
+
+
+def missing_binary_error() -> str:
+    return UNTRUSTED_MESSAGE if user_copy_of_egpu_binary() else NOT_FOUND_MESSAGE
 
 
 def parse_status(raw: str) -> dict:
@@ -660,7 +713,7 @@ async def rebind_egpu_audio(slot: str) -> None:
     decky.logger.info(f"Audio rebind: bind {audio_fn}: ok={ok} err={err!r}")
 
 
-def find_parent_bridge(bus_id: str) -> str | None:
+def find_parent_bridge(bus_id: str, sysfs: str = "/sys") -> str | None:
     """
     Finds the PCI bridge whose secondary bus hosts bus_id, matched purely by
     bus number - deliberately doesn't require bus_id's own sysfs device node
@@ -671,10 +724,12 @@ def find_parent_bridge(bus_id: str) -> str | None:
     subdirectory for its secondary bus regardless of whether anything is
     plugged into it, so the bridge itself is always discoverable this way.
     """
-    target_bus = bus_id.split(":")[1].lower()
-    for path in glob.glob("/sys/bus/pci/devices/*/pci_bus/*"):
-        child_bus = os.path.basename(path).split(":")[-1].lower()
-        if child_bus == target_bus:
+    # Domain and bus ("0000:66"): matching the bus number alone could pick a
+    # bridge in another PCI domain (Intel VMD, multi-domain machines) and
+    # remove whatever sits behind it.
+    domain, bus = bus_id.split(":")[0].lower(), bus_id.split(":")[1].lower()
+    for path in glob.glob(f"{sysfs}/bus/pci/devices/*/pci_bus/*"):
+        if os.path.basename(path).lower() == f"{domain}:{bus}":
             return os.path.basename(path.split("/pci_bus/")[0])
     return None
 
@@ -682,36 +737,94 @@ def find_parent_bridge(bus_id: str) -> str | None:
 DEFAULT_SETTINGS = {"auto_eject": False, "deep_rescan": False}
 
 
-def get_settings_path() -> str | None:
+SETTINGS_NAME = "settings.json"
+SETTINGS_MAX_BYTES = 4096
+
+
+def open_settings_dir() -> int:
+    """
+    The settings folder, opened without following a single link. It lives in
+    the user's home, and this plugin runs as root: a link there would make
+    root read or write wherever the user pointed it. Walks the resolved path
+    one directory at a time with O_NOFOLLOW (so nothing can be swapped
+    between the check and the open) and accepts the folder only when it
+    belongs to the Decky user, or to root inside that user's home.
+    """
     settings_dir = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
     if not settings_dir:
-        return None
-    return os.path.join(settings_dir, "settings.json")
+        raise OSError("DECKY_PLUGIN_SETTINGS_DIR is not set")
+    real = os.path.realpath(settings_dir)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in [p for p in real.split("/") if p]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        owner = os.fstat(fd).st_uid
+        home = os.path.realpath(os.environ.get("DECKY_USER_HOME") or "/nonexistent")
+        if owner != resolve_host_uid() and not (owner == 0 and real.startswith(home + "/")):
+            raise OSError(f"{real} does not belong to the Decky user")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def load_settings() -> dict:
-    path = get_settings_path()
-    if not path or not os.path.isfile(path):
-        return dict(DEFAULT_SETTINGS)
+    out = dict(DEFAULT_SETTINGS)
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return {**DEFAULT_SETTINGS, **data}
-    except (OSError, json.JSONDecodeError, TypeError):
-        return dict(DEFAULT_SETTINGS)
+        dfd = open_settings_dir()
+    except OSError:
+        return out
+    try:
+        fd = os.open(SETTINGS_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > SETTINGS_MAX_BYTES:
+                return out
+            data = json.loads(os.read(fd, SETTINGS_MAX_BYTES + 1) or b"{}")
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return out
+    finally:
+        os.close(dfd)
+    # Only the known options, only as booleans: nothing else read here ever
+    # reaches the frontend.
+    if isinstance(data, dict):
+        for key in DEFAULT_SETTINGS:
+            if isinstance(data.get(key), bool):
+                out[key] = data[key]
+    return out
 
 
 def save_settings(settings: dict) -> tuple[bool, str]:
-    path = get_settings_path()
-    if not path:
-        return False, "DECKY_PLUGIN_SETTINGS_DIR is not set"
+    data = json.dumps({key: bool(settings.get(key)) for key in DEFAULT_SETTINGS}).encode()
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(settings, f)
-        return True, ""
+        dfd = open_settings_dir()
     except OSError as e:
         return False, str(e)
+    tmp = f".settings-{secrets.token_hex(8)}.json"
+    try:
+        # A new file of our own, never an existing name or a link, then an
+        # atomic rename over settings.json (which replaces a link instead of
+        # writing through it).
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, SETTINGS_NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return True, ""
+    except OSError as e:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        return False, str(e)
+    finally:
+        os.close(dfd)
 
 
 async def unload_and_remove_pci(
@@ -814,7 +927,7 @@ class Plugin:
                 "bus_id": None,
                 "driver": None,
                 "gpu_name": None,
-                "error": None,
+                "error": UNTRUSTED_MESSAGE if user_copy_of_egpu_binary() else None,
             }
         try:
             proc = await asyncio.to_thread(
@@ -949,7 +1062,7 @@ class Plugin:
         async with self._operation_lock:
             binary = find_egpu_binary()
             if not binary:
-                return {"ok": False, "error": "all-ways-egpu binary not found on this system."}
+                return {"ok": False, "error": missing_binary_error()}
             try:
                 proc = await asyncio.to_thread(
                     subprocess.run,
@@ -1237,7 +1350,7 @@ class Plugin:
         async with self._operation_lock:
             binary = find_egpu_binary()
             if not binary:
-                return {"ok": False, "error": "all-ways-egpu binary not found on this system."}
+                return {"ok": False, "error": missing_binary_error()}
             slot_to_rebind = None
             if mode == "egpu":
                 # After an eject, the eGPU is genuinely gone from lspci (removed from
@@ -1312,7 +1425,7 @@ class Plugin:
         async with self._operation_lock:
             binary = find_egpu_binary()
             if not binary:
-                return {"ok": False, "error": "all-ways-egpu binary not found on this system."}
+                return {"ok": False, "error": missing_binary_error()}
 
             try:
                 proc = await asyncio.to_thread(

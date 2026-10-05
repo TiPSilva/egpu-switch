@@ -24,12 +24,29 @@ log() {
     logger -t egpu-shutdown-eject "$1"
 }
 
-# Same lookup order as the Decky plugin's find_egpu_binary(): on Bazzite /
-# SteamOS (read-only /usr), all-ways-egpu's installer falls back to the
-# user's ~/bin, which is not on root's PATH when systemd runs this unit.
+# Root runs all-ways-egpu here, so only a copy root alone can change: the
+# file and every directory above it owned by root, not writable by group or
+# others. On Bazzite / SteamOS its installer puts it in ~/bin, which any
+# program running as the user can replace; that copy is not used. Install it
+# system-wide once with:
+#   sudo install -o root -g root -m 755 ~/bin/all-ways-egpu /usr/local/bin/
+trusted() {
+    P=$(readlink -f -- "$1") || return 1
+    [ -f "$P" ] && [ -x "$P" ] || return 1
+    while :; do
+        OWNER=$(stat -c '%u' -- "$P") || return 1
+        MODE=$(stat -c '%a' -- "$P") || return 1
+        [ "$OWNER" = 0 ] || return 1
+        [ $(( 0$MODE & 022 )) -eq 0 ] || return 1
+        [ "$P" = / ] && return 0
+        P=$(dirname -- "$P")
+    done
+}
+
+# Same lookup as the Decky plugin's find_egpu_binary().
 find_egpu_binary() {
-    for P in /usr/bin/all-ways-egpu /usr/local/bin/all-ways-egpu /home/*/bin/all-ways-egpu; do
-        if [ -x "$P" ]; then
+    for P in /usr/bin/all-ways-egpu /usr/local/bin/all-ways-egpu; do
+        if trusted "$P"; then
             echo "$P"
             return 0
         fi
@@ -38,7 +55,7 @@ find_egpu_binary() {
 }
 
 AWE_BIN=$(find_egpu_binary) || {
-    log "all-ways-egpu not found (checked /usr/bin, /usr/local/bin, /home/*/bin), nothing to do"
+    log "no root-owned all-ways-egpu in /usr/bin or /usr/local/bin, nothing to do"
     exit 0
 }
 
@@ -103,19 +120,19 @@ printf '%s\n' "$BUS_LINES" | while read -r BUS _CONFIGURED_DRIVER; do
         # an explicit unbind here would just fail with ENOENT. Only sibling
         # functions still on another live driver (e.g. snd_hda_intel for the
         # HDMI audio function) need the explicit unbind.
+        # Errors are kept in a variable: no fixed file names in /tmp as root.
         if [ -n "$FDRIVER" ] && [ "$FDRIVER" != "nvidia" ] && [ -e "/sys/bus/pci/drivers/$FDRIVER/unbind" ]; then
-            if ! echo "$FBUS" > "/sys/bus/pci/drivers/$FDRIVER/unbind" 2>/tmp/egpu-shutdown-eject-unbind.err; then
-                log "unbind $FBUS from $FDRIVER failed: $(cat /tmp/egpu-shutdown-eject-unbind.err)"
+            if ! ERR=$( { echo "$FBUS" > "/sys/bus/pci/drivers/$FDRIVER/unbind"; } 2>&1 ); then
+                log "unbind $FBUS from $FDRIVER failed: $ERR"
             fi
         fi
-        if echo 1 > "$FUNC/remove" 2>/tmp/egpu-shutdown-eject-remove.err; then
+        if ERR=$( { echo 1 > "$FUNC/remove"; } 2>&1 ); then
             log "ejected $FBUS (driver was: ${FDRIVER:-none})"
         else
-            log "remove $FBUS failed: $(cat /tmp/egpu-shutdown-eject-remove.err)"
+            log "remove $FBUS failed: $ERR"
         fi
     done
 done
-rm -f /tmp/egpu-shutdown-eject-unbind.err /tmp/egpu-shutdown-eject-remove.err
 
 log "done"
 exit 0

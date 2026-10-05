@@ -10,7 +10,7 @@ npx rollup -c
 
 rm -rf out
 mkdir -p out/egpu-switch/dist
-cp plugin.json main.py package.json out/egpu-switch/
+cp plugin.json main.py package.json LICENSE out/egpu-switch/
 cp dist/index.js out/egpu-switch/dist/
 
 (cd out && zip -r egpu-switch.zip egpu-switch)

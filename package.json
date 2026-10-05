@@ -1,6 +1,6 @@
 {
   "name": "egpu-switch",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Toggle all-ways-egpu boot-VGA (eGPU/iGPU) and recover the display manager, from Deck mode.",
   "author": "TiPSilva",
   "license": "MIT",

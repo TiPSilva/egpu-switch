@@ -166,7 +166,9 @@ const Content: FC = () => {
 
   const statusLine = (() => {
     if (!status) return 'Loading…';
-    if (!status.installed) return 'all-ways-egpu is not installed on this system.';
+    // Not found, or found only in ~/bin, which this root plugin no longer runs
+    // (the backend explains how to install it system-wide).
+    if (!status.installed) return status.error ?? 'all-ways-egpu is not installed on this system.';
     if (!status.setup_done) return "Not configured. Run 'all-ways-egpu setup' once from a terminal.";
     if (!status.egpu_connected) return 'eGPU configured but not detected (check the eGPU cable).';
     return status.egpu_active
@@ -236,6 +238,13 @@ const Content: FC = () => {
 
   return (
     <PanelSection>
+      <PanelSectionRow>
+        <Field focusable bottomSeparator="none" childrenLayout="below" childrenContainerWidth="max">
+          <span style={{ color: '#fbbf24', fontWeight: 'bold' }}>
+            Discontinued. Move to Yby eGPU (github.com/TiPSilva/yby-egpu).
+          </span>
+        </Field>
+      </PanelSectionRow>
       <PanelSectionRow>
         <Field label="eGPU cable" focusable>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>

@@ -12,18 +12,37 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# Same lookup as the eject script itself: on Bazzite / SteamOS (read-only
-# /usr), all-ways-egpu installs to the user's ~/bin, not on root's PATH.
+# Root runs all-ways-egpu here, so only a copy root alone can change: the
+# file and every directory above it owned by root, not writable by group or
+# others. On Bazzite / SteamOS its installer puts it in ~/bin, which any
+# program running as the user can replace; that copy is not used. Install it
+# system-wide once with:
+#   sudo install -o root -g root -m 755 ~/bin/all-ways-egpu /usr/local/bin/
+trusted() {
+    P=$(readlink -f -- "$1") || return 1
+    [ -f "$P" ] && [ -x "$P" ] || return 1
+    while :; do
+        OWNER=$(stat -c '%u' -- "$P") || return 1
+        MODE=$(stat -c '%a' -- "$P") || return 1
+        [ "$OWNER" = 0 ] || return 1
+        [ $(( 0$MODE & 022 )) -eq 0 ] || return 1
+        [ "$P" = / ] && return 0
+        P=$(dirname -- "$P")
+    done
+}
+
+# Same lookup as the eject script itself.
 FOUND=""
-for P in /usr/bin/all-ways-egpu /usr/local/bin/all-ways-egpu /home/*/bin/all-ways-egpu; do
-    if [ -x "$P" ]; then
+for P in /usr/bin/all-ways-egpu /usr/local/bin/all-ways-egpu; do
+    if trusted "$P"; then
         FOUND="$P"
         break
     fi
 done
 if [ -z "$FOUND" ]; then
-    echo "all-ways-egpu not found (checked /usr/bin, /usr/local/bin, /home/*/bin)." >&2
-    echo "Install it and run 'all-ways-egpu setup' first." >&2
+    echo "No root-owned all-ways-egpu in /usr/bin or /usr/local/bin." >&2
+    echo "If yours is in ~/bin, install it system-wide first:" >&2
+    echo "  sudo install -o root -g root -m 755 ~/bin/all-ways-egpu /usr/local/bin/" >&2
     exit 1
 fi
 echo "Found all-ways-egpu at: $FOUND"

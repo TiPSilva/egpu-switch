@@ -1,5 +1,43 @@
 # eGPU Switch
 
+> **This plugin is discontinued.** Its successor is
+> **[Yby eGPU](https://github.com/TiPSilva/yby-egpu)**: GPU switching and
+> safe eject, with a desktop app, a command-line interface, boot on the eGPU
+> and sleep protection. It works without all-ways-egpu. Version 0.3.4 is the
+> last release and only fixes security issues. Please move to Yby eGPU: its
+> installer handles removing egpu-switch from Decky.
+>
+> <details><summary>Português · Español · 简体中文 · Français</summary>
+>
+> **Este plugin foi descontinuado.** O sucessor é o
+> [Yby eGPU](https://github.com/TiPSilva/yby-egpu), que reúne troca de GPU
+> e ejeção segura, app do desktop, linha de comando, inicialização na eGPU
+> e proteção da suspensão, sem depender do all-ways-egpu. A versão 0.3.4 é a última e só corrige falhas
+> de segurança. Migre para o Yby eGPU: o instalador remove o egpu-switch
+> do Decky durante a migração.
+>
+> **Este plugin está descontinuado.** Su sucesor es
+> [Yby eGPU](https://github.com/TiPSilva/yby-egpu), que reúne cambio de GPU
+> y expulsión segura, app de escritorio, línea de comandos, arranque con la
+> eGPU y protección de la suspensión, sin depender de all-ways-egpu. La versión
+> 0.3.4 es la última y solo corrige fallos de seguridad. Pásate a Yby eGPU:
+> su instalador retira egpu-switch de Decky durante la migración.
+>
+> **此插件已停止维护。** 它的继任者是
+> [Yby eGPU](https://github.com/TiPSilva/yby-egpu)：保留 GPU 切换和安全弹出功能，并提供
+> 桌面应用、命令行、从 eGPU 启动、睡眠保护，以及无需 all-ways-egpu 的原生切换。
+> 0.3.4 是最后一个版本，只修复安全问题。请迁移到 Yby eGPU：安装程序会在迁移时
+> 将 egpu-switch 移出 Decky。
+>
+> **Ce plugin est abandonné.** Son successeur est
+> [Yby eGPU](https://github.com/TiPSilva/yby-egpu), qui propose le basculement
+> de GPU et l'éjection sûre, une application de bureau, une interface en
+> ligne de commande, le démarrage sur l'eGPU et la protection de la veille,
+> sans dépendre d'all-ways-egpu. La version 0.3.4 est la dernière et ne corrige que des
+> failles de sécurité. Passez à Yby eGPU : son installateur retire
+> egpu-switch de Decky pour vous.
+> </details>
+
 A Decky Loader plugin that automates [`all-ways-egpu`](https://github.com/ewagner12/all-ways-egpu)
 directly from Deck Mode, without needing to switch to Desktop Mode.
 
@@ -10,7 +48,11 @@ interactive menu already runs.
 
 ## Prerequisites
 
-- `all-ways-egpu` already installed on the system.
+- `all-ways-egpu` already installed **system-wide**, owned by root: in `/usr/bin` or
+  `/usr/local/bin`. Since 0.3.4 the plugin, which runs as root, no longer runs a copy in
+  `~/bin` (any program running as your user could replace it). If all-ways-egpu's
+  installer put it there (Bazzite, SteamOS), install it system-wide once, in Desktop Mode:
+  `sudo install -o root -g root -m 755 ~/bin/all-ways-egpu /usr/local/bin/`
 - `all-ways-egpu setup` already run **manually once**, from a terminal (Desktop Mode),
   selecting the eGPU. The plugin doesn't do that interactive setup; it only toggles the
   boot VGA of an already-existing configuration.

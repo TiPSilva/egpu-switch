@@ -46,8 +46,13 @@ sys.modules["decky"].logger = type(
     "L", (), {m: staticmethod(lambda *a, **k: None) for m in ("info", "warning", "error")}
 )()
 
+import main as plugin_main  # noqa: E402
 from main import (  # noqa: E402
     audio_eld_healthy,
+    find_parent_bridge,
+    load_settings,
+    save_settings,
+    trusted_executable,
     devices_needing_authorization,
     mounted_storage_under,
     parse_status,
@@ -317,6 +322,78 @@ check(
     audio_eld_healthy("0000:66:00.1", audio_root, proc_asound),
     True,
 )
+
+# --- 0.3.4 security fixes -------------------------------------------------
+# Root must never run a file the user can change (all-ways-egpu in ~/bin).
+# owner_uid lets this run on a tree the test owns; the rest of the chain up
+# to / is the real system's, owned by root.
+me = os.getuid()
+tree = tempfile.mkdtemp()
+os.chmod(tree, 0o755)
+good = os.path.join(tree, "awe")
+with open(good, "w") as f:
+    f.write("#!/bin/sh\n")
+os.chmod(good, 0o755)
+check("trust: an executable whose whole path only its owner can write", trusted_executable(good, me), True)
+check("trust: the same file is refused when it must belong to root", trusted_executable(good, 0), me == 0)
+os.chmod(tree, 0o775)
+check("trust: a folder the group can write to is refused", trusted_executable(good, me), False)
+os.chmod(tree, 0o755)
+os.chmod(good, 0o757)
+check("trust: a file others can write to is refused", trusted_executable(good, me), False)
+os.chmod(good, 0o755)
+writable = tempfile.mkdtemp()
+os.chmod(writable, 0o777)
+target = os.path.join(writable, "awe")
+with open(target, "w") as f:
+    f.write("#!/bin/sh\n")
+os.chmod(target, 0o755)
+link = os.path.join(tree, "link")
+os.symlink(target, link)
+check("trust: a link is judged by where it leads", trusted_executable(link, me), False)
+check("trust: a missing file is refused", trusted_executable(os.path.join(tree, "nope"), me), False)
+
+# Settings live in the user's home and root writes them: a link there must
+# never make root write or read somewhere else.
+home = tempfile.mkdtemp()
+sdir = os.path.join(home, "homebrew", "settings", "egpu-switch")
+os.makedirs(sdir)
+os.environ["DECKY_PLUGIN_SETTINGS_DIR"] = sdir
+os.environ["DECKY_USER_HOME"] = home
+plugin_main.resolve_host_uid = lambda: me
+check("settings: saved", save_settings({"auto_eject": True, "deep_rescan": False, "extra": "x"}), (True, ""))
+check("settings: only the two known options are written",
+      sorted(__import__("json").load(open(os.path.join(sdir, "settings.json")))), ["auto_eject", "deep_rescan"])
+check("settings: read back", load_settings(), {"auto_eject": True, "deep_rescan": False})
+victim = os.path.join(tempfile.mkdtemp(), "victim")
+with open(victim, "w") as f:
+    f.write("precious")
+os.remove(os.path.join(sdir, "settings.json"))
+os.symlink(victim, os.path.join(sdir, "settings.json"))
+check("settings: a link in place of the file is never read through", load_settings(),
+      {"auto_eject": False, "deep_rescan": False})
+save_settings({"auto_eject": True})
+check("settings: saving replaces the link instead of writing through it", open(victim).read(), "precious")
+check("settings: and the file is a real one again", os.path.islink(os.path.join(sdir, "settings.json")), False)
+with open(os.path.join(sdir, "settings.json"), "w") as f:
+    f.write('{"auto_eject": "yes", "deep_rescan": true, "secret": "x"}')
+check("settings: wrong types and unknown keys never come back", load_settings(),
+      {"auto_eject": False, "deep_rescan": True})
+elsewhere = tempfile.mkdtemp()
+os.rename(sdir, sdir + ".real")
+os.symlink(elsewhere, sdir)
+plugin_main.resolve_host_uid = lambda: me + 1
+check("settings: a folder that is not the Decky user's is refused", save_settings({"auto_eject": True})[0], False)
+check("settings: and nothing was written there", os.listdir(elsewhere), [])
+plugin_main.resolve_host_uid = lambda: me
+
+# Deep rescan: the parent bridge must match the PCI domain, not just the bus.
+sysfs = tempfile.mkdtemp()
+for bridge, child in (("10000:e0:06.0", "10000:66"), ("0000:00:07.1", "0000:66")):
+    os.makedirs(os.path.join(sysfs, "bus", "pci", "devices", bridge, "pci_bus", child))
+check("bridge: same bus number in another domain is not picked",
+      find_parent_bridge("0000:66:00.0", sysfs), "0000:00:07.1")
+check("bridge: nothing on that bus", find_parent_bridge("0000:67:00.0", sysfs), None)
 
 # --- report ---------------------------------------------------------------
 if failures:
